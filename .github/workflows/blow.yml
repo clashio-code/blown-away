@@ -1,35 +1,368 @@
-# Taruh sebagai .github/workflows/build-blownaway-probe.yml
-# Butuh di repo: src/elfprobe_unity.c  dan  launcher/BlownAwayProbe.sh
-# Build armhf di runner x86 (cross-compile), sama pola dengan workflow Luxor. Guard glibc <= 2.37 (device).
+# Satu file, tanpa file lain di repo. Taruh sebagai .github/workflows/build-blownaway-probe.yml
+# lalu Actions > build-blownaway-probe > Run workflow. Hasil: artifact "blownaway-probe-armhf" berisi
+#   BlownAwayProbe.sh                    (launcher muOS)
+#   blownaway/elfprobe_unity             (probe ELF armhf, hanya membaca)
+#   blownaway/libs/                      (taruh libmain.so, libmono.so, libunity.so di sini)
+# Cross-compile armhf di runner x86, pola sama dengan workflow Luxor. Guard glibc <= 2.37 (device).
 name: build-blownaway-probe
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - "src/elfprobe_unity.c"
-      - "launcher/BlownAwayProbe.sh"
       - ".github/workflows/build-blownaway-probe.yml"
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
       - name: Pasang toolchain ARM 32-bit
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Kompilasi elfprobe_unity (armhf)
+      - name: Tulis sumber (elfprobe_unity.c dan BlownAwayProbe.sh)
         run: |
-          mkdir -p out/blownaway/libs
-          arm-linux-gnueabihf-gcc -O2 -Wall -Wextra -o out/blownaway/elfprobe_unity src/elfprobe_unity.c -ldl
-          cp launcher/BlownAwayProbe.sh out/BlownAwayProbe.sh
+          mkdir -p src out/blownaway/libs
+          cat > src/elfprobe_unity.c <<'EOF_C'
+          /* elfprobe_unity - Milestone 1 port Blown Away (Unity 4.6.6f2 Mono, armeabi-v7a) ke muOS armhf.
+           * Diturunkan dari elfprobe milik port Luxor. HANYA MEMBACA: mem-parse libmain.so / libmono.so / libunity.so
+           * (ELF32 ARM), lalu laporkan: library yang dibutuhkan, histogram relokasi, TLS, TEXTREL, packed reloc,
+           * ekspor JNI, dan tiap simbol impor dibandingkan dengan glibc + GLESv2/EGL/zlib/SDL2 32-bit di device.
+           * Tidak menjalankan satu pun kode game.
+           * Pakai: elfprobe_unity report.txt libmain.so libmono.so libunity.so
+           * Catatan build: JANGAN pakai strtol/sscanf/atoi (di toolchain baru terikat ke GLIBC_2.38, device cuma 2.37). */
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <stdarg.h>
+          #include <elf.h>
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <sys/utsname.h>
+          #include <gnu/libc-version.h>
+
+          #define MAXLIB 4
+          #define MAXN 4096
+
+          #ifndef DT_RELR
+          #define DT_RELR 36
+          #endif
+
+          typedef struct {
+            char name[64];
+            const uint8_t *map; size_t size;
+            const Elf32_Ehdr *eh; const Elf32_Shdr *sh; const Elf32_Phdr *ph;
+            const Elf32_Sym *sym; int nsym; const char *str;
+            const Elf32_Dyn *dyn; int ndyn;
+          } Lib;
+
+          static FILE *rep;
+
+          static void P(const char *fmt, ...) {
+            va_list ap;
+            va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
+            if (rep) { va_start(ap, fmt); vfprintf(rep, fmt, ap); va_end(ap); }
+          }
+
+          static const char *base_name(const char *p) { const char *s = strrchr(p, '/'); return s ? s + 1 : p; }
+
+          static int load_lib(const char *path, Lib *L) {
+            struct stat st;
+            int fd, i;
+            memset(L, 0, sizeof *L);
+            snprintf(L->name, sizeof L->name, "%s", base_name(path));
+            fd = open(path, O_RDONLY);
+            if (fd < 0) { P("GAGAL membuka %s\n", path); return -1; }
+            if (fstat(fd, &st) != 0) { close(fd); return -1; }
+            L->size = (size_t)st.st_size;
+            L->map = mmap(NULL, L->size, PROT_READ, MAP_PRIVATE, fd, 0);
+            close(fd);
+            if (L->map == MAP_FAILED) { P("GAGAL mmap %s\n", path); return -1; }
+            if (L->size < sizeof(Elf32_Ehdr) || memcmp(L->map, ELFMAG, SELFMAG) != 0) { P("%s bukan file ELF\n", path); return -1; }
+            L->eh = (const Elf32_Ehdr *)L->map;
+            if (L->eh->e_ident[EI_CLASS] != ELFCLASS32 || L->eh->e_machine != EM_ARM) {
+              P("%s bukan ELF ARM 32-bit (class=%d machine=%d)\n", path, L->eh->e_ident[EI_CLASS], L->eh->e_machine);
+              return -1;
+            }
+            if (L->eh->e_phoff && L->eh->e_phentsize == sizeof(Elf32_Phdr) &&
+                (size_t)L->eh->e_phoff + (size_t)L->eh->e_phnum * sizeof(Elf32_Phdr) <= L->size)
+              L->ph = (const Elf32_Phdr *)(L->map + L->eh->e_phoff);
+            if (L->eh->e_shoff == 0 || L->eh->e_shentsize != sizeof(Elf32_Shdr) ||
+                (size_t)L->eh->e_shoff + (size_t)L->eh->e_shnum * sizeof(Elf32_Shdr) > L->size) {
+              P("%s: section header tidak ada/rusak (library di-strip penuh?)\n", path); return -1;
+            }
+            L->sh = (const Elf32_Shdr *)(L->map + L->eh->e_shoff);
+            for (i = 0; i < L->eh->e_shnum; i++) {
+              const Elf32_Shdr *s = &L->sh[i];
+              if ((size_t)s->sh_offset + s->sh_size > L->size) continue;
+              if (s->sh_type == SHT_DYNSYM) {
+                L->sym = (const Elf32_Sym *)(L->map + s->sh_offset);
+                L->nsym = (int)(s->sh_size / sizeof(Elf32_Sym));
+                if (s->sh_link < L->eh->e_shnum) L->str = (const char *)(L->map + L->sh[s->sh_link].sh_offset);
+              } else if (s->sh_type == SHT_DYNAMIC) {
+                L->dyn = (const Elf32_Dyn *)(L->map + s->sh_offset);
+                L->ndyn = (int)(s->sh_size / sizeof(Elf32_Dyn));
+              }
+            }
+            if (!L->sym || !L->str) { P("%s: .dynsym tidak ditemukan\n", path); return -1; }
+            return 0;
+          }
+
+          static const char *rname(unsigned t) {
+            switch (t) {
+              case 0: return "NONE"; case 2: return "ABS32"; case 3: return "REL32"; case 13: return "TLS_DESC";
+              case 17: return "TLS_DTPMOD32"; case 18: return "TLS_DTPOFF32"; case 19: return "TLS_TPOFF32";
+              case 20: return "COPY"; case 21: return "GLOB_DAT"; case 22: return "JUMP_SLOT"; case 23: return "RELATIVE";
+              case 160: return "IRELATIVE"; default: return "?";
+            }
+          }
+
+          static void print_structure(const Lib *L) {
+            int i, has_tls = 0, ntext_rel = 0, packed = 0;
+            unsigned cnt[256], nrela = 0, ninit = 0, nfini = 0, has_init = 0;
+            memset(cnt, 0, sizeof cnt);
+            for (i = 0; i < L->ndyn; i++) {
+              const Elf32_Dyn *d = &L->dyn[i];
+              switch (d->d_tag) {
+                case DT_NEEDED: P("  NEEDED %s\n", L->str + d->d_un.d_val); break;
+                case DT_SONAME: P("  SONAME %s\n", L->str + d->d_un.d_val); break;
+                case DT_TEXTREL: ntext_rel = 1; break;
+                case DT_FLAGS: if (d->d_un.d_val & DF_TEXTREL) ntext_rel = 1; break;
+                case DT_RELA: nrela = 1; break;
+                case DT_RELR: case 0x6000000f: case 0x60000011: case 0x6fffe000: packed = 1; break;
+                case DT_INIT: has_init = 1; break;
+                case DT_INIT_ARRAYSZ: ninit = d->d_un.d_val / 4; break;
+                case DT_FINI_ARRAYSZ: nfini = d->d_un.d_val / 4; break;
+                default: break;
+              }
+            }
+            if (L->ph) for (i = 0; i < L->eh->e_phnum; i++) if (L->ph[i].p_type == PT_TLS) {
+              has_tls = 1;
+              P("  PT_TLS: ukuran=%u (file=%u) align=%u  <-- relokasi TLS & __tls_get_addr perlu ditangani loader\n", L->ph[i].p_memsz, L->ph[i].p_filesz, L->ph[i].p_align);
+            }
+            for (i = 0; i < L->eh->e_shnum; i++) {
+              const Elf32_Shdr *s = &L->sh[i];
+              unsigned k, n;
+              const Elf32_Rel *r;
+              if (s->sh_type != SHT_REL || (size_t)s->sh_offset + s->sh_size > L->size) continue;
+              r = (const Elf32_Rel *)(L->map + s->sh_offset); n = s->sh_size / sizeof(Elf32_Rel);
+              for (k = 0; k < n; k++) cnt[ELF32_R_TYPE(r[k].r_info) & 0xff]++;
+            }
+            P("  init: DT_INIT=%s init_array=%u fini_array=%u\n", has_init ? "ya" : "tidak", ninit, nfini);
+            P("  TEXTREL: %s | RELA: %s | packed reloc (RELR/ANDROID_REL): %s\n", ntext_rel ? "YA (perlu mprotect saat relokasi)" : "tidak", nrela ? "YA" : "tidak", packed ? "YA (loader perlu dekoder)" : "tidak");
+            P("  PT_TLS: %s\n", has_tls ? "ada" : "tidak ada");
+            P("  histogram relokasi (yang didukung loader Luxor: RELATIVE, ABS32, GLOB_DAT, JUMP_SLOT):\n");
+            for (i = 0; i < 256; i++) if (cnt[i]) P("    %-14s (%3d) : %u%s\n", rname((unsigned)i), i, cnt[i],
+                (i == 23 || i == 2 || i == 21 || i == 22) ? "" : "   <-- BELUM didukung");
+          }
+
+          static int has_export(const Lib *L, const char *name) {
+            int i;
+            for (i = 1; i < L->nsym; i++) {
+              const Elf32_Sym *s = &L->sym[i];
+              if (s->st_shndx != SHN_UNDEF && s->st_name && strcmp(L->str + s->st_name, name) == 0) return 1;
+            }
+            return 0;
+          }
+
+          static int starts_any(const char *n, const char *const *pfx) {
+            int i;
+            for (i = 0; pfx[i]; i++) if (strncmp(n, pfx[i], strlen(pfx[i])) == 0) return 1;
+            return 0;
+          }
+
+          /* ada di glibc tapi layout/ABI beda dari bionic -> perlu pembungkus */
+          static const char *const risky_pfx[] = { "pthread_", "sem_", "stat", "fstat", "lstat", "readdir", "scandir", "opendir", "closedir",
+            "setjmp", "longjmp", "_setjmp", "_longjmp", "sigsetjmp", "siglongjmp", "sigaction", "signal", "sigprocmask", "sigaltstack",
+            "dlopen", "dlsym", "dlclose", "dlerror", "dl_iterate_phdr", "getpwnam", "getpwuid", "sysconf", "fopen", "freopen", NULL };
+
+          /* pantau khusus Mono/JIT/sinyal/unwind: ini yang membuat Bogodroid crash di thread pertama */
+          static const char *const watch_pfx[] = { "dl_iterate_phdr", "dl_unwind_find_exidx", "__gnu_Unwind_Find_exidx", "_Unwind_",
+            "__cxa_throw", "__cxa_begin_catch", "__cxa_rethrow", "__aeabi_unwind", "sigaction", "sigaltstack", "signal", "pthread_kill",
+            "pthread_sigmask", "sigprocmask", "mmap", "mprotect", "madvise", "mincore", "syscall", "backtrace", "getauxval", "sched_",
+            "clone", "personality", "__tls_get_addr", "pthread_key_", "pthread_getspecific", "pthread_setspecific", NULL };
+
+          /* simbol bionic yang SUDAH ada shim-nya di loader Luxor */
+          static const char *const luxor_shim[] = { "__errno", "__android_log_print", "__android_log_write", "__assert2", "__aeabi_atexit",
+            "__register_frame_info", "__deregister_frame_info", "_Jv_RegisterClasses", "__stack_chk_guard", "__sF", "_ctype_",
+            "_tolower_tab_", "_toupper_tab_", "__srget", "__swbuf", NULL };
+
+          static const char *const gl_pfx[] = { "gl", "egl", NULL };
+
+          static void *try_open(const char *p) {
+            void *h = dlopen(p, RTLD_LAZY | RTLD_LOCAL);
+            P("  dlopen %-36s : %s\n", p, h ? "OK" : dlerror());
+            return h;
+          }
+
+          static const char *g_list_name[MAXN];
+
+          static void classify(const Lib *libs, int nl, int idx, void *hg2, void *hg1, void *he, void *hz, void *hs, void *hm) {
+            static const char *ok[MAXN], *risky[MAXN], *gl[MAXN], *shimk[MAXN], *watch[MAXN], *miss[MAXN], *other[MAXN];
+            int nok = 0, nrisky = 0, ngl = 0, nshim = 0, nwatch = 0, nmiss = 0, nother = 0, i, j, nimp = 0;
+            const Lib *L = &libs[idx];
+            (void)g_list_name;
+            P("\n=== %s: klasifikasi simbol impor ===\n", L->name);
+            for (i = 1; i < L->nsym; i++) {
+              const Elf32_Sym *s = &L->sym[i];
+              const char *n;
+              int found = 0;
+              if (s->st_shndx != SHN_UNDEF || !s->st_name) continue;
+              n = L->str + s->st_name;
+              nimp++;
+              if (starts_any(n, watch_pfx) && nwatch < MAXN) watch[nwatch++] = n;
+              for (j = 0; j < nl && !found; j++) if (j != idx && has_export(&libs[j], n)) { if (nother < MAXN) other[nother++] = n; found = 1; }
+              if (found) continue;
+              if (starts_any(n, luxor_shim) && !dlsym(RTLD_DEFAULT, n)) { if (nshim < MAXN) shimk[nshim++] = n; continue; }
+              if (strncmp(n, "__sF", 4) == 0) { if (nshim < MAXN) shimk[nshim++] = n; continue; }
+              if (dlsym(RTLD_DEFAULT, n)) { if (starts_any(n, risky_pfx)) { if (nrisky < MAXN) risky[nrisky++] = n; } else if (nok < MAXN) ok[nok++] = n; continue; }
+              if ((hg2 && dlsym(hg2, n)) || (hg1 && dlsym(hg1, n)) || (he && dlsym(he, n)) || (hz && dlsym(hz, n)) || (hs && dlsym(hs, n)) || (hm && dlsym(hm, n))) {
+                if (ngl < MAXN) gl[ngl++] = n; continue;
+              }
+              if (nmiss < MAXN) miss[nmiss++] = n;
+            }
+            P("total impor=%d | dari lib game lain=%d | ada di glibc (aman)=%d | ada di glibc tapi ABI beda=%d | shim Luxor sudah ada=%d | ada di GL/EGL/z/SDL device=%d | TIDAK ADA=%d\n",
+              nimp, nother, nok, nrisky, nshim, ngl, nmiss);
+          #define DUMP(title, arr, cnt) do { int q; P("\n-- %s (%d)\n", title, cnt); for (q = 0; q < cnt; q++) P("  %s\n", arr[q]); } while (0)
+            DUMP("PANTAU Mono/JIT/sinyal/unwind/TLS", watch, nwatch);
+            DUMP("ABI-RISK: ada di glibc tapi perlu pembungkus", risky, nrisky);
+            DUMP("SHIM LUXOR: bionic-only, sudah ada di loader Luxor", shimk, nshim);
+            DUMP("TIDAK ADA: perlu shim/implementasi baru", miss, nmiss);
+          #undef DUMP
+          }
+
+          static void gl_report(const Lib *L, void *hg2, void *hg1, void *he, void *hm) {
+            int i, total = 0, ok2 = 0, ok1 = 0;
+            P("\n=== fungsi GL/EGL yang dipakai %s ===\n  huruf: 2=libGLESv2  1=libGLESv1_CM  E=libEGL  M=libmali  (-=tidak ada)\n", L->name);
+            for (i = 1; i < L->nsym; i++) {
+              const Elf32_Sym *s = &L->sym[i];
+              const char *n;
+              int a, b, c, d;
+              if (s->st_shndx != SHN_UNDEF || !s->st_name) continue;
+              n = L->str + s->st_name;
+              if (!starts_any(n, gl_pfx)) continue;
+              a = hg2 && dlsym(hg2, n) != NULL; b = hg1 && dlsym(hg1, n) != NULL; c = he && dlsym(he, n) != NULL; d = hm && dlsym(hm, n) != NULL;
+              total++; if (a || c || d) ok2++; if (b) ok1++;
+              P("  %c%c%c%c %s\n", a ? '2' : '-', b ? '1' : '-', c ? 'E' : '-', d ? 'M' : '-', n);
+            }
+            P("ringkas: %d fungsi GL/EGL dipakai | %d tersedia di GLESv2/EGL/mali | %d tersedia di GLESv1_CM\n", total, ok2, ok1);
+          }
+
+          static void jni_report(const Lib *L) {
+            int i, n = 0;
+            P("\n=== ekspor %s ===\n", L->name);
+            for (i = 1; i < L->nsym; i++) {
+              const Elf32_Sym *s = &L->sym[i];
+              const char *nm;
+              if (s->st_shndx == SHN_UNDEF || !s->st_name) continue;
+              nm = L->str + s->st_name;
+              if (n < 300 || strncmp(nm, "Java_", 5) == 0 || strcmp(nm, "JNI_OnLoad") == 0) P("  %s\n", nm);
+              n++;
+            }
+            P("  total simbol terekspor: %d\n", n);
+          }
+
+          int main(int argc, char **argv) {
+            Lib libs[MAXLIB];
+            struct utsname u;
+            void *hg2, *hg1, *he, *hz, *hs, *hm;
+            int i, nl = 0;
+
+            if (argc < 3) { fprintf(stderr, "pakai: %s report.txt lib1.so [lib2.so ...]\n", argv[0]); return 2; }
+            rep = fopen(argv[1], "w");
+            P("== elfprobe_unity (Blown Away, Unity 4.6.6f2 Mono, Milestone 1) ==\n");
+            if (uname(&u) == 0) P("device: %s %s %s\n", u.sysname, u.release, u.machine);
+            P("glibc: %s\n", gnu_get_libc_version());
+
+            dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
+            dlopen("libgcc_s.so.1", RTLD_NOW | RTLD_GLOBAL);
+            dlopen("libstdc++.so.6", RTLD_NOW | RTLD_GLOBAL);
+
+            P("\n== library 32-bit di device ==\n");
+            hg2 = try_open("/usr/lib32/libGLESv2.so.2");
+            hg1 = try_open("/usr/lib32/libGLESv1_CM.so.1");
+            he  = try_open("/usr/lib32/libEGL.so.1");
+            hm  = try_open("/usr/lib32/libmali.so");
+            hz  = try_open("/usr/lib32/libz.so.1");
+            hs  = try_open("/usr/lib32/libSDL2-2.0.so.0");
+            if (!hs) hs = try_open("libSDL2-2.0.so.0");
+            try_open("/usr/lib32/libOpenSLES.so");
+            try_open("/usr/lib32/libandroid.so");
+
+            for (i = 2; i < argc && nl < MAXLIB; i++) {
+              P("\n== %s ==\n", base_name(argv[i]));
+              if (load_lib(argv[i], &libs[nl]) != 0) continue;
+              print_structure(&libs[nl]);
+              nl++;
+            }
+            for (i = 0; i < nl; i++) jni_report(&libs[i]);
+            for (i = 0; i < nl; i++) classify(libs, nl, i, hg2, hg1, he, hz, hs, hm);
+            for (i = 0; i < nl; i++) if (strstr(libs[i].name, "unity")) gl_report(&libs[i], hg2, hg1, he, hm);
+
+            P("\n== selesai ==\n");
+            if (rep) fclose(rep);
+            return 0;
+          }
+          EOF_C
+          cat > out/BlownAwayProbe.sh <<'EOF_SH'
+          #!/bin/bash
+          # Probe Blown Away (Unity 4.6.6f2 Mono, armeabi-v7a), Milestone 1. Hanya membaca, tidak mengubah apa pun.
+          # Pola launcher sama dengan LuxorProbe.sh: folder data dicari di /$directory/ports/blownaway
+
+          XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+
+          if [ -d "/opt/system/Tools/PortMaster/" ]; then
+            controlfolder="/opt/system/Tools/PortMaster"
+          elif [ -d "/opt/tools/PortMaster/" ]; then
+            controlfolder="/opt/tools/PortMaster"
+          elif [ -d "$XDG_DATA_HOME/PortMaster/" ]; then
+            controlfolder="$XDG_DATA_HOME/PortMaster"
+          else
+            controlfolder="/roms/ports/PortMaster"
+          fi
+
+          source $controlfolder/control.txt
+          [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
+
+          GAMEDIR="/$directory/ports/blownaway"
+          [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/blownaway"
+
+          cd "$GAMEDIR" || {
+            echo "folder blownaway tidak ketemu. Dicari di: /$directory/ports/blownaway dan di sebelah script ini." > "$(dirname "$0")/probe_error.txt"
+            exit 1
+          }
+
+          export LD_LIBRARY_PATH="/usr/lib32:/lib32:${LD_LIBRARY_PATH}"
+          chmod +x ./elfprobe_unity 2>/dev/null
+
+          echo "GAMEDIR=$GAMEDIR" > probe_stdout.txt
+          for f in libmain.so libmono.so libunity.so; do
+            if [ ! -f "libs/$f" ]; then
+              echo "libs/$f belum ada di $GAMEDIR/libs" > probe_report.txt
+              sleep 3
+              exit 1
+            fi
+          done
+
+          ./elfprobe_unity probe_report.txt libs/libmain.so libs/libmono.so libs/libunity.so >> probe_stdout.txt 2>&1
+          echo "exit code: $?" >> probe_stdout.txt
+          sleep 2
+          type pm_finish >/dev/null 2>&1 && pm_finish
+          EOF_SH
           bash -n out/BlownAwayProbe.sh
           echo "Taruh libmain.so, libmono.so, libunity.so (dari lib/armeabi-v7a di APK) di folder ini. Jangan di-upload ke GitHub." > out/blownaway/libs/TARUH-LIB-DI-SINI.txt
+
+      - name: Kompilasi elfprobe_unity (armhf)
+        run: |
+          arm-linux-gnueabihf-gcc -O2 -Wall -Wextra -o out/blownaway/elfprobe_unity src/elfprobe_unity.c -ldl
           file out/blownaway/elfprobe_unity || true
+          echo "--- library yang dibutuhkan:"
           arm-linux-gnueabihf-readelf -d out/blownaway/elfprobe_unity | grep NEEDED
           MAXV=$(arm-linux-gnueabihf-readelf -V out/blownaway/elfprobe_unity | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
           echo "butuh GLIBC tertinggi: $MAXV (device: 2.37)"
@@ -39,7 +372,8 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/upload-artifact@v4
+      - name: Unggah hasil build
+        uses: actions/upload-artifact@v4
         with:
           name: blownaway-probe-armhf
           path: out
