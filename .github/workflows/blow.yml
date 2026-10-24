@@ -1,0 +1,45 @@
+# Taruh sebagai .github/workflows/build-blownaway-probe.yml
+# Butuh di repo: src/elfprobe_unity.c  dan  launcher/BlownAwayProbe.sh
+# Build armhf di runner x86 (cross-compile), sama pola dengan workflow Luxor. Guard glibc <= 2.37 (device).
+name: build-blownaway-probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/elfprobe_unity.c"
+      - "launcher/BlownAwayProbe.sh"
+      - ".github/workflows/build-blownaway-probe.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pasang toolchain ARM 32-bit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+
+      - name: Kompilasi elfprobe_unity (armhf)
+        run: |
+          mkdir -p out/blownaway/libs
+          arm-linux-gnueabihf-gcc -O2 -Wall -Wextra -o out/blownaway/elfprobe_unity src/elfprobe_unity.c -ldl
+          cp launcher/BlownAwayProbe.sh out/BlownAwayProbe.sh
+          bash -n out/BlownAwayProbe.sh
+          echo "Taruh libmain.so, libmono.so, libunity.so (dari lib/armeabi-v7a di APK) di folder ini. Jangan di-upload ke GitHub." > out/blownaway/libs/TARUH-LIB-DI-SINI.txt
+          file out/blownaway/elfprobe_unity || true
+          arm-linux-gnueabihf-readelf -d out/blownaway/elfprobe_unity | grep NEEDED
+          MAXV=$(arm-linux-gnueabihf-readelf -V out/blownaway/elfprobe_unity | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+          echo "butuh GLIBC tertinggi: $MAXV (device: 2.37)"
+          if [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
+            echo "GAGAL: butuh glibc lebih baru dari 2.37. Simbol penyebab:"
+            arm-linux-gnueabihf-nm -D --undefined-only out/blownaway/elfprobe_unity | grep -E 'GLIBC_2\.(3[89]|[4-9][0-9])'
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blownaway-probe-armhf
+          path: out
