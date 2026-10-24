@@ -1,12 +1,12 @@
-name: Build Blown Away M4 (armhf)
+name: Build Blown Away M4b (armhf)
 
-# Milestone 4: window SDL2 + EGL dibungkus ke SDL + loop nativeRender (dump frame ke BMP).
-# Jalankan manual: tab Actions -> "Build Blown Away M4 (armhf)" -> Run workflow.
+# Milestone 4b (M4 + penelusuran akses file + penangkap crash m4loader): window SDL2 + EGL dibungkus ke SDL + loop nativeRender (dump frame ke BMP).
+# Jalankan manual: tab Actions -> "Build Blown Away M4b (armhf)" -> Run workflow.
 on:
   workflow_dispatch:
   push:
     paths:
-      - '.github/workflows/build-blownaway-m4.yml'
+      - '.github/workflows/build-blownaway-m4b.yml'
 
 jobs:
   build:
@@ -21,7 +21,7 @@ jobs:
         run: |
           mkdir -p src out/blownaway
           cat > src/m4loader.c <<'EOF_C'
-          /* m4loader (dasar: m3loader, Milestone 3 + 4) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
+          /* m4loader (dasar: m3loader, Milestone 3 + 4b) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
            * Isi: loader ELF ARM buatan sendiri (libmain/libmono/libunity tidak bisa di-dlopen glibc), shim bionic->glibc,
            *      fake JNIEnv/JavaVM yang mencatat semua permintaan, crash handler yang menunjuk lib+offset.
            * Pakai: m3loader --stage N --libdir DIR --apk FILE --datadir DIR --log FILE
@@ -70,6 +70,7 @@ jobs:
           static FILE *g_log;
           static int g_stage = 1, g_run_init = 0;
           static char g_libdir[256] = "libs", g_apk[300] = "", g_datadir[300] = "files";
+          static int g_query = 0;
           static int g_screen_w = 640, g_screen_h = 480, g_orient = 0, g_maxsec = 90, g_maxframes = 1000000;
           static volatile int g_frames;
           static int g_dump[16], g_ndump;
@@ -239,8 +240,9 @@ jobs:
           }
 
           /* ---- stat / dirent: layout bionic arm == kernel stat64/dirent64 == glibc *64 ---- */
-          static int shim_stat(const char *p, void *b) { return stat64(p, (struct stat64 *)b); }
-          static int shim_lstat(const char *p, void *b) { return lstat64(p, (struct stat64 *)b); }
+          static int g_stat_n;
+          static int shim_stat(const char *p, void *b) { int r = stat64(p, (struct stat64 *)b); if (g_stat_n < 200) { g_stat_n++; LOG("[FS] stat(\"%s\") -> %d\n", p, r); } return r; }
+          static int shim_lstat(const char *p, void *b) { int r = lstat64(p, (struct stat64 *)b); if (g_stat_n < 200) { g_stat_n++; LOG("[FS] lstat(\"%s\") -> %d\n", p, r); } return r; }
           static int shim_fstat(int fd, void *b) { return fstat64(fd, (struct stat64 *)b); }
           static void *shim_readdir(DIR *d) { return (void *)readdir64(d); }
 
@@ -388,6 +390,10 @@ jobs:
           static int shim_sigaction(int sig, const BSigaction *act, BSigaction *old) {
             struct sigaction a, o; int r;
             memset(&a, 0, sizeof a); memset(&o, 0, sizeof o);
+            if (act && (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE || sig == SIGABRT || sig == SIGTRAP)) {
+              u32 off; const char *ln = addr2lib(act->handler, &off);
+              if (!strcmp(ln, "libunity.so")) { LOG("[SHIM] sigaction(%d): handler crash milik libunity (+0x%x) diabaikan, pakai penangkap m4loader\n", sig, off); if (old) memset(old, 0, sizeof *old); return 0; }
+            }
             if (act) {
               a.sa_handler = (void (*)(int))PTR(act->handler);
               a.sa_flags = act->flags; bmask2host(act->mask, &a.sa_mask);
@@ -594,6 +600,26 @@ jobs:
             for (i = 0; i < 20; i++) dig[i] = (uint8_t)(c->st[i / 4] >> (24 - 8 * (i % 4)));
           }
 
+          /* ---- penelusuran akses file/env (diagnosis nativeFile / pemuatan data) ---- */
+          static int g_fs_n;
+          #define FSLOG(...) do { if (g_fs_n < 500) { g_fs_n++; LOG(__VA_ARGS__); } } while (0)
+          static FILE *shim_fopen(const char *p, const char *m) {
+            FILE *f = fopen(p, m);
+            FSLOG("[FS] fopen(\"%s\",\"%s\") -> %s\n", p, m, f ? "ok" : strerror(errno));
+            return f;
+          }
+          static int shim_open(const char *p, int fl, ...) {
+            va_list ap; int mode, fd;
+            va_start(ap, fl); mode = va_arg(ap, int); va_end(ap);
+            fd = open(p, fl, mode);
+            FSLOG("[FS] open(\"%s\",0x%x) -> %d %s\n", p, fl, fd, fd < 0 ? strerror(errno) : "");
+            return fd;
+          }
+          static int shim_access(const char *p, int m) { int r = access(p, m); FSLOG("[FS] access(\"%s\",%d) -> %d\n", p, m, r); return r; }
+          static void *shim_opendir(const char *p) { DIR *d = opendir(p); FSLOG("[FS] opendir(\"%s\") -> %s\n", p, d ? "ok" : strerror(errno)); return d; }
+          static int shim_mkdir(const char *p, mode_t m) { int r = mkdir(p, m); FSLOG("[FS] mkdir(\"%s\") -> %d\n", p, r); return r; }
+          static char *shim_getenv(const char *n) { char *v = getenv(n); FSLOG("[ENV] getenv(%s) = %s\n", n, v ? v : "(null)"); return v; }
+
           /* ---- SDL2 (dlopen) + EGL dibungkus ke SDL ---- */
           static struct {
             int (*Init)(unsigned); void *(*CreateWindow)(const char *, int, int, int, int, unsigned); int (*GL_SetAttribute)(int, int);
@@ -750,6 +776,7 @@ jobs:
             SH("__gnu_Unwind_Find_exidx", shim_find_exidx),
             SH("SHA1Init", shim_SHA1Init), SH("SHA1Update", shim_SHA1Update), SH("SHA1Final", shim_SHA1Final),
             SH("dlopen", shim_dlopen), SH("dlsym", shim_dlsym), SH("dlclose", shim_dlclose), SH("dlerror", shim_dlerror),
+            SH("fopen", shim_fopen), SH("open", shim_open), SH("access", shim_access), SH("opendir", shim_opendir), SH("mkdir", shim_mkdir), SH("getenv", shim_getenv),
             SH("eglGetDisplay", shim_eglGetDisplay), SH("eglInitialize", shim_eglInitialize), SH("eglChooseConfig", shim_eglChooseConfig),
             SH("eglGetConfigAttrib", shim_eglGetConfigAttrib), SH("eglCreateContext", shim_eglCreateContext),
             SH("eglCreateWindowSurface", shim_eglCreateWindowSurface), SH("eglMakeCurrent", shim_eglMakeCurrent), SH("eglSwapBuffers", shim_eglSwapBuffers),
@@ -1054,7 +1081,7 @@ jobs:
             c = ++m->ncalls;
             if (c <= 3 || (c & (c - 1)) == 0) LOG("[JNI] Call%s %s.%s%s (#%d)\n", m->is_static ? "Static" : "", m->cls ? m->cls->cname : "?", m->name, m->sig, c);
             rs = strrchr(m->sig, ')'); if (!rs) return 0; rs++;
-            if (rs[0] == 'I') { if (!strcmp(m->name, "getWidth")) return (u32)g_screen_w; if (!strcmp(m->name, "getHeight")) return (u32)g_screen_h; }
+            if (rs[0] == 'I') { if (!strcmp(m->name, "getSplashMode")) return 2; /* settings.xml: splash_mode=2 */ if (!strcmp(m->name, "getWidth")) return (u32)g_screen_w; if (!strcmp(m->name, "getHeight")) return (u32)g_screen_h; }
             if (rs[0] == 'L') {
               char cn[120]; size_t n = strlen(rs) - 2; JObj *o;
               if (!strcmp(rs, "Ljava/lang/String;")) return U32(str_new(special_string(m->name, thiz)));
@@ -1265,8 +1292,8 @@ jobs:
             Native *n_rd = find_native("UnityPlayer", "nativeRender");
             struct timespec t0, t1; int it = 0, falses = 0; uint8_t ev[64]; pthread_t wd; double el;
             if (!n_gfx || !n_rs || !n_rd || !n_re) { LOG("native render tidak lengkap\n"); return 1; }
-            if (n_aa) LOG("== nativeRequestedAA = %d\n", ((NatI0)n_aa->fn)(&g_env_head, player));
-            if (n_32) LOG("== nativeRequested32bitDisplayBuffer = %d\n", ((NatI0)n_32->fn)(&g_env_head, player) & 0xff);
+            if (g_query && n_aa) LOG("== nativeRequestedAA = %d\n", ((NatI0)n_aa->fn)(&g_env_head, player));
+            if (g_query && n_32) LOG("== nativeRequested32bitDisplayBuffer = %d\n", ((NatI0)n_32->fn)(&g_env_head, player) & 0xff);
             LOG("== SDL/EGL init ...\n");
             if (gfx_init()) return 1;
             if (n_or) ((NatVI)n_or->fn)(&g_env_head, player, g_orient);
@@ -1314,6 +1341,7 @@ jobs:
               else if (!strcmp(argv[i], "--maxframes") && i + 1 < argc) g_maxframes = parse_i(argv[++i]);
               else if (!strcmp(argv[i], "--orient") && i + 1 < argc) g_orient = parse_i(argv[++i]);
               else if (!strcmp(argv[i], "--dump") && i + 1 < argc) parse_dump(argv[++i]);
+              else if (!strcmp(argv[i], "--query")) g_query = 1;
               else if (!strcmp(argv[i], "--size") && i + 1 < argc) { const char *z = argv[++i]; g_screen_w = parse_i(z); while (*z && *z != 'x') z++; if (*z == 'x') g_screen_h = parse_i(z + 1); }
             }
             {
@@ -1433,5 +1461,5 @@ jobs:
       - name: Unggah artefak
         uses: actions/upload-artifact@v4
         with:
-          name: blownaway-m4-armhf
+          name: blownaway-m4b-armhf
           path: out/
