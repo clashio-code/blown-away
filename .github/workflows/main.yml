@@ -1,12 +1,12 @@
-name: Build Blown Away M3 (armhf)
+name: Build Blown Away M4 (armhf)
 
-# Milestone 3: loader ELF buatan sendiri + shim bionic->glibc + fake JNI untuk libmain/libmono/libunity.
-# Jalankan manual: tab Actions -> "Build Blown Away M3 (armhf)" -> Run workflow.
+# Milestone 4: window SDL2 + EGL dibungkus ke SDL + loop nativeRender (dump frame ke BMP).
+# Jalankan manual: tab Actions -> "Build Blown Away M4 (armhf)" -> Run workflow.
 on:
   workflow_dispatch:
   push:
     paths:
-      - '.github/workflows/build-blownaway-m3.yml'
+      - '.github/workflows/build-blownaway-m4.yml'
 
 jobs:
   build:
@@ -20,14 +20,15 @@ jobs:
       - name: Tulis source loader
         run: |
           mkdir -p src out/blownaway
-          cat > src/m3loader.c <<'EOF_C'
-          /* m3loader - Milestone 3 port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
+          cat > src/m4loader.c <<'EOF_C'
+          /* m4loader (dasar: m3loader, Milestone 3 + 4) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
            * Isi: loader ELF ARM buatan sendiri (libmain/libmono/libunity tidak bisa di-dlopen glibc), shim bionic->glibc,
            *      fake JNIEnv/JavaVM yang mencatat semua permintaan, crash handler yang menunjuk lib+offset.
            * Pakai: m3loader --stage N --libdir DIR --apk FILE --datadir DIR --log FILE
            *   stage 1: muat 3 lib + relokasi + resolusi simbol (TIDAK menjalankan kode game). Laporan simbol yang tak ketemu.
            *   stage 2: stage 1 + jalankan konstruktor + JNI_OnLoad(libmain) + NativeLoader.load + JNI_OnLoad(libunity).
-           *   stage 3: stage 2 + panggil UnityPlayer.initJni dan nativeFile (belum ada layar/EGL/audio).
+           *   stage 3: stage 2 + panggil UnityPlayer.initJni dan nativeFile.
+           *   stage 4: stage 3 + window SDL2 + EGL dibungkus ke SDL + loop nativeRender (dump frame ke BMP). Belum ada audio/input.
            * Catatan build: JANGAN pakai strtol/sscanf/atoi/strlcpy langsung (header toolchain baru mengikat ke GLIBC_2.38, device 2.37). */
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -69,6 +70,10 @@ jobs:
           static FILE *g_log;
           static int g_stage = 1, g_run_init = 0;
           static char g_libdir[256] = "libs", g_apk[300] = "", g_datadir[300] = "files";
+          static int g_screen_w = 640, g_screen_h = 480, g_orient = 0, g_maxsec = 90, g_maxframes = 1000000;
+          static volatile int g_frames;
+          static int g_dump[16], g_ndump;
+          static void *g_win, *g_ctx;
 
           static void LOG(const char *fmt, ...) {
             va_list ap;
@@ -110,7 +115,7 @@ jobs:
           }
 
           /* ------------------------------------------------------------------ crash handler */
-          static void crash_handler(int sig, siginfo_t *si, void *ucv) {
+          static void dump_regs(const char *tag, int sig, siginfo_t *si, void *ucv) {
             u32 pc = 0, lr = 0, sp = 0, o1, o2, i;
             const char *n1, *n2;
             (void)ucv;
@@ -123,7 +128,7 @@ jobs:
             }
           #endif
             n1 = addr2lib(pc, &o1); n2 = addr2lib(lr, &o2);
-            LOG("\n*** CRASH sinyal=%d fault_addr=%p\n    pc=%08x (%s+0x%x)\n    lr=%08x (%s+0x%x)\n    sp=%08x\n", sig, si ? si->si_addr : NULL,
+            LOG("\n*** %s sinyal=%d fault_addr=%p\n    pc=%08x (%s+0x%x)\n    lr=%08x (%s+0x%x)\n    sp=%08x\n", tag, sig, si ? si->si_addr : NULL,
                 pc, n1, o1, lr, n2, o2, sp);
             if (sp) {
               LOG("    tumpukan (alamat yang menunjuk ke lib game):\n");
@@ -132,8 +137,9 @@ jobs:
                 if (n[0] != '?') LOG("      [sp+%u] %08x (%s+0x%x)\n", i * 4, w, n, o);
               }
             }
-            _exit(128 + sig);
           }
+          static void crash_handler(int sig, siginfo_t *si, void *ucv) { dump_regs("CRASH", sig, si, ucv); _exit(128 + sig); }
+          static void hang_handler(int sig, siginfo_t *si, void *ucv) { dump_regs("THREAD UTAMA DIAM (watchdog)", sig, si, ucv); }
           static void install_crash(void) {
             struct sigaction sa; stack_t ss; static const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP, 0 };
             int i;
@@ -142,6 +148,8 @@ jobs:
             memset(&sa, 0, sizeof sa);
             sa.sa_sigaction = crash_handler; sa.sa_flags = SA_SIGINFO | SA_ONSTACK; sigemptyset(&sa.sa_mask);
             for (i = 0; sigs[i]; i++) sigaction(sigs[i], &sa, NULL);
+            sa.sa_sigaction = hang_handler; sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+            sigaction(SIGURG, &sa, NULL);
           }
 
           /* ------------------------------------------------------------------ thunk: stub bernama untuk simbol yang tak ketemu */
@@ -188,6 +196,7 @@ jobs:
 
           /* ================================================================== SHIM bionic -> glibc ================ */
           #define PTRMIN 0x10000u
+          #define PATH_MAX_M 4096
 
           static int shim_page_size = 4096;
           static u32 shim_guard = 0x5a3c9e71u;
@@ -585,6 +594,120 @@ jobs:
             for (i = 0; i < 20; i++) dig[i] = (uint8_t)(c->st[i / 4] >> (24 - 8 * (i % 4)));
           }
 
+          /* ---- SDL2 (dlopen) + EGL dibungkus ke SDL ---- */
+          static struct {
+            int (*Init)(unsigned); void *(*CreateWindow)(const char *, int, int, int, int, unsigned); int (*GL_SetAttribute)(int, int);
+            void *(*GL_CreateContext)(void *); int (*GL_MakeCurrent)(void *, void *); void (*GL_SwapWindow)(void *);
+            void *(*GL_GetProcAddress)(const char *); const char *(*GetError)(void); int (*GL_SetSwapInterval)(int);
+            void (*GetWindowSize)(void *, int *, int *); int (*PollEvent)(void *); const char *(*GetCurrentVideoDriver)(void);
+          } sdl;
+          static char g_egl_dpy[16], g_egl_cfg[16], g_egl_surf[16];
+          static int g_egl_logged;
+
+          static void dump_frame(int n) {
+            void (*readpx)(int, int, int, int, unsigned, unsigned, void *);
+            int w = g_screen_w, h = g_screen_h, i; uint8_t *buf; char fn[64]; FILE *f; uint8_t hd[54]; u32 sz;
+            *(void **)&readpx = sdl.GL_GetProcAddress("glReadPixels");
+            if (!readpx) return;
+            buf = malloc((size_t)w * h * 4);
+            if (!buf) return;
+            readpx(0, 0, w, h, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, buf);
+            for (i = 0; i < w * h; i++) { uint8_t t = buf[i * 4]; buf[i * 4] = buf[i * 4 + 2]; buf[i * 4 + 2] = t; buf[i * 4 + 3] = 255; }
+            snprintf(fn, sizeof fn, "m4_frame_%d.bmp", n);
+            f = fopen(fn, "wb");
+            if (f) {
+              sz = 54 + (u32)w * h * 4; memset(hd, 0, 54);
+              hd[0] = 'B'; hd[1] = 'M'; memcpy(hd + 2, &sz, 4); hd[10] = 54; hd[14] = 40;
+              memcpy(hd + 18, &w, 4); memcpy(hd + 22, &h, 4); hd[26] = 1; hd[28] = 32;
+              fwrite(hd, 1, 54, f); fwrite(buf, 1, (size_t)w * h * 4, f); fclose(f);
+              LOG("[GFX] frame %d disimpan ke %s (%dx%d)\n", n, fn, w, h);
+            }
+            free(buf);
+          }
+          static void *shim_eglGetDisplay(void *d) { (void)d; LOG("[EGL] eglGetDisplay\n"); return g_egl_dpy; }
+          static unsigned shim_eglInitialize(void *d, int *ma, int *mi) { (void)d; if (ma) *ma = 1; if (mi) *mi = 4; LOG("[EGL] eglInitialize -> 1.4\n"); return 1; }
+          static unsigned shim_eglChooseConfig(void *d, const int *a, void **cfgs, int sz, int *n) {
+            (void)d;
+            if (!g_egl_logged++) { LOG("[EGL] eglChooseConfig atribut:"); for (; a && a[0] != 0x3038; a += 2) LOG(" 0x%x=%d", a[0], a[1]); LOG("\n"); }
+            if (cfgs && sz > 0) cfgs[0] = g_egl_cfg;
+            if (n) *n = 1;
+            return 1;
+          }
+          static unsigned shim_eglGetConfigAttrib(void *d, void *c, int attr, int *v) {
+            int r = 0; (void)d; (void)c;
+            switch (attr) {
+              case 0x3024: case 0x3023: case 0x3022: case 0x3021: r = 8; break; /* R G B A */
+              case 0x3020: r = 32; break; /* BUFFER_SIZE */
+              case 0x3025: r = 24; break; /* DEPTH */
+              case 0x3026: r = 8; break; /* STENCIL */
+              case 0x3040: r = 4; break; /* RENDERABLE_TYPE = ES2 */
+              case 0x3033: r = 4; break; /* SURFACE_TYPE = WINDOW */
+              case 0x3028: r = 1; break; /* CONFIG_ID */
+              case 0x302E: r = 1; break; /* NATIVE_VISUAL_ID */
+              default: r = 0;
+            }
+            if (v) *v = r;
+            return 1;
+          }
+          static void *shim_eglCreateContext(void *d, void *c, void *share, const int *a) {
+            (void)d; (void)c; (void)share;
+            LOG("[EGL] eglCreateContext atribut:"); for (; a && a[0] != 0x3038; a += 2) LOG(" 0x%x=%d", a[0], a[1]); LOG(" -> konteks SDL %p\n", g_ctx);
+            return g_ctx;
+          }
+          static void *shim_eglCreateWindowSurface(void *d, void *c, void *w, const int *a) { (void)d; (void)c; (void)w; (void)a; LOG("[EGL] eglCreateWindowSurface -> permukaan SDL\n"); return g_egl_surf; }
+          static unsigned shim_eglMakeCurrent(void *d, void *dr, void *rd, void *ctx) {
+            static int n; int r; (void)d; (void)dr; (void)rd;
+            r = sdl.GL_MakeCurrent(g_win, ctx ? g_ctx : NULL);
+            if (n++ < 6) LOG("[EGL] eglMakeCurrent(%s) -> %d\n", ctx ? "ctx" : "NULL", r);
+            if (r) LOG("[EGL] SDL_GL_MakeCurrent gagal: %s\n", sdl.GetError());
+            return r == 0;
+          }
+          static unsigned shim_eglSwapBuffers(void *d, void *s) {
+            int i, n = g_frames + 1; (void)d; (void)s;
+            for (i = 0; i < g_ndump; i++) if (g_dump[i] == n) dump_frame(n);
+            sdl.GL_SwapWindow(g_win);
+            g_frames = n;
+            if (n <= 3 || n % 300 == 0) LOG("[GFX] eglSwapBuffers #%d\n", n);
+            return 1;
+          }
+          static unsigned shim_egl_ok(void) { return 1; }
+          static unsigned shim_eglGetError(void) { return 0x3000; }
+          static void *shim_eglGetProcAddress(const char *n) { return sdl.GL_GetProcAddress ? sdl.GL_GetProcAddress(n) : NULL; }
+
+          static int gfx_init(void) {
+            static const char *const names[] = { "libSDL2-2.0.so.0", "libSDL2-2.0.so", "libSDL2.so", NULL };
+            void *h = NULL; int i, tries; static const int depth[2][2] = { { 24, 8 }, { 16, 0 } };
+            for (i = 0; names[i] && !h; i++) h = dlopen(names[i], RTLD_NOW | RTLD_GLOBAL);
+            if (!h) { LOG("[GFX] libSDL2 tidak ditemukan (cek LD_LIBRARY_PATH)\n"); return 1; }
+          #define SYM(f, n) do { *(void **)&sdl.f = dlsym(h, n); if (!sdl.f) { LOG("[GFX] simbol SDL hilang: %s\n", n); return 1; } } while (0)
+            SYM(Init, "SDL_Init"); SYM(CreateWindow, "SDL_CreateWindow"); SYM(GL_SetAttribute, "SDL_GL_SetAttribute");
+            SYM(GL_CreateContext, "SDL_GL_CreateContext"); SYM(GL_MakeCurrent, "SDL_GL_MakeCurrent"); SYM(GL_SwapWindow, "SDL_GL_SwapWindow");
+            SYM(GL_GetProcAddress, "SDL_GL_GetProcAddress"); SYM(GetError, "SDL_GetError"); SYM(GL_SetSwapInterval, "SDL_GL_SetSwapInterval");
+            SYM(GetWindowSize, "SDL_GetWindowSize"); SYM(PollEvent, "SDL_PollEvent"); SYM(GetCurrentVideoDriver, "SDL_GetCurrentVideoDriver");
+          #undef SYM
+            if (sdl.Init(0x20 /*VIDEO*/)) { LOG("[GFX] SDL_Init gagal: %s\n", sdl.GetError()); return 1; }
+            LOG("[GFX] SDL video driver: %s\n", sdl.GetCurrentVideoDriver() ? sdl.GetCurrentVideoDriver() : "?");
+            for (tries = 0; tries < 2; tries++) {
+              sdl.GL_SetAttribute(21, 4); sdl.GL_SetAttribute(17, 2); sdl.GL_SetAttribute(18, 0); /* profil ES 2.0 */
+              sdl.GL_SetAttribute(0, 8); sdl.GL_SetAttribute(1, 8); sdl.GL_SetAttribute(2, 8); sdl.GL_SetAttribute(3, 8);
+              sdl.GL_SetAttribute(5, 1); sdl.GL_SetAttribute(6, depth[tries][0]); sdl.GL_SetAttribute(7, depth[tries][1]);
+              g_win = sdl.CreateWindow("Blown Away", 0x1FFF0000, 0x1FFF0000, g_screen_w, g_screen_h, 0x1001 /*FULLSCREEN_DESKTOP*/ | 0x2 /*OPENGL*/ | 0x4);
+              if (!g_win) { LOG("[GFX] SDL_CreateWindow gagal: %s\n", sdl.GetError()); continue; }
+              g_ctx = sdl.GL_CreateContext(g_win);
+              if (g_ctx) { LOG("[GFX] konteks GLES2 dibuat (depth=%d stencil=%d)\n", depth[tries][0], depth[tries][1]); break; }
+              LOG("[GFX] SDL_GL_CreateContext gagal (depth=%d): %s\n", depth[tries][0], sdl.GetError());
+            }
+            if (!g_win || !g_ctx) return 1;
+            sdl.GetWindowSize(g_win, &g_screen_w, &g_screen_h);
+            sdl.GL_SetSwapInterval(1);
+            LOG("[GFX] ukuran jendela %dx%d\n", g_screen_w, g_screen_h);
+            {
+              const char *(*gs)(unsigned) = (const char *(*)(unsigned))sdl.GL_GetProcAddress("glGetString");
+              if (gs) LOG("[GFX] GL_RENDERER=%s GL_VERSION=%s\n", gs(0x1F01), gs(0x1F02));
+            }
+            return 0;
+          }
+
           /* ---- tabel shim ---- */
           typedef struct { const char *n; void *a; } Shim;
           #define SH(n, f) { n, (void *)(f) }
@@ -627,6 +750,11 @@ jobs:
             SH("__gnu_Unwind_Find_exidx", shim_find_exidx),
             SH("SHA1Init", shim_SHA1Init), SH("SHA1Update", shim_SHA1Update), SH("SHA1Final", shim_SHA1Final),
             SH("dlopen", shim_dlopen), SH("dlsym", shim_dlsym), SH("dlclose", shim_dlclose), SH("dlerror", shim_dlerror),
+            SH("eglGetDisplay", shim_eglGetDisplay), SH("eglInitialize", shim_eglInitialize), SH("eglChooseConfig", shim_eglChooseConfig),
+            SH("eglGetConfigAttrib", shim_eglGetConfigAttrib), SH("eglCreateContext", shim_eglCreateContext),
+            SH("eglCreateWindowSurface", shim_eglCreateWindowSurface), SH("eglMakeCurrent", shim_eglMakeCurrent), SH("eglSwapBuffers", shim_eglSwapBuffers),
+            SH("eglDestroyContext", shim_egl_ok), SH("eglDestroySurface", shim_egl_ok), SH("eglTerminate", shim_egl_ok),
+            SH("eglGetError", shim_eglGetError), SH("eglGetProcAddress", shim_eglGetProcAddress),
             { NULL, NULL }
           };
 
@@ -926,6 +1054,7 @@ jobs:
             c = ++m->ncalls;
             if (c <= 3 || (c & (c - 1)) == 0) LOG("[JNI] Call%s %s.%s%s (#%d)\n", m->is_static ? "Static" : "", m->cls ? m->cls->cname : "?", m->name, m->sig, c);
             rs = strrchr(m->sig, ')'); if (!rs) return 0; rs++;
+            if (rs[0] == 'I') { if (!strcmp(m->name, "getWidth")) return (u32)g_screen_w; if (!strcmp(m->name, "getHeight")) return (u32)g_screen_h; }
             if (rs[0] == 'L') {
               char cn[120]; size_t n = strlen(rs) - 2; JObj *o;
               if (!strcmp(rs, "Ljava/lang/String;")) return U32(str_new(special_string(m->name, thiz)));
@@ -940,7 +1069,7 @@ jobs:
           }
           static u32 jni_CallI(void *env, JObj *o, JMeth *m, ...) { (void)env; return call_core(m, o); }
           static long long jni_CallJ(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o); return 0; }
-          static float jni_CallF(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o); return 0.0f; }
+          static float jni_CallF(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o); return (m && !strcmp(m->name, "getRefreshRate")) ? 60.0f : 0.0f; }
           static double jni_CallD(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o); return 0.0; }
           static void jni_CallV(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o); }
           static JObj *jni_NewObject(void *env, JObj *c, JMeth *m, ...) {
@@ -957,8 +1086,8 @@ jobs:
           static int field_int(JField *f) {
             if (!f) return 0;
             if (!strcmp(f->name, "SDK_INT")) return 19;
-            if (!strcmp(f->name, "widthPixels")) return 640;
-            if (!strcmp(f->name, "heightPixels")) return 480;
+            if (!strcmp(f->name, "widthPixels")) return g_screen_w;
+            if (!strcmp(f->name, "heightPixels")) return g_screen_h;
             if (!strcmp(f->name, "densityDpi")) return 160;
             return 0;
           }
@@ -1101,16 +1230,98 @@ jobs:
             LOG("=========================================\n");
           }
 
+
+          static pthread_t g_main_thread;
+          static void *wd_thread(void *a) {
+            int last = -1, stuck = 0; (void)a;
+            for (;;) {
+              sleep(8);
+              LOG("[wd] frame=%d\n", g_frames);
+              if (g_frames == last) { if (++stuck >= 2) { LOG("[wd] tidak ada frame baru, minta thread utama menunjukkan posisinya\n"); pthread_kill(g_main_thread, SIGURG); } }
+              else stuck = 0;
+              last = g_frames;
+            }
+            return NULL;
+          }
+          static int parse_i(const char *s) { int v = 0; while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0'); return v; }
+          static void parse_dump(const char *s) {
+            int v = 0, have = 0;
+            for (;; s++) {
+              if (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); have = 1; }
+              else { if (have && g_ndump < 16) g_dump[g_ndump++] = v; v = 0; have = 0; if (!*s) break; }
+            }
+          }
+          typedef int (*NatI0)(void *, void *);
+          typedef void (*NatV0)(void *, void *);
+          typedef void (*NatVI)(void *, void *, int);
+          typedef void (*NatVP)(void *, void *, void *);
+          typedef void (*NatV4)(void *, void *, int, int, int, int);
+
+          static int run_gfx(JObj *player) {
+            Native *n_aa = find_native("UnityPlayer", "nativeRequestedAA"), *n_32 = find_native("UnityPlayer", "nativeRequested32bitDisplayBuffer");
+            Native *n_or = find_native("UnityPlayer", "nativeDeviceOrientation"), *n_dd = find_native("UnityPlayer", "nativeSetDefaultDisplay");
+            Native *n_gfx = find_native("UnityPlayer", "nativeRecreateGfxState"), *n_rs = find_native("UnityPlayer", "nativeResize");
+            Native *n_fc = find_native("UnityPlayer", "nativeFocusChanged"), *n_re = find_native("UnityPlayer", "nativeResume");
+            Native *n_rd = find_native("UnityPlayer", "nativeRender");
+            struct timespec t0, t1; int it = 0, falses = 0; uint8_t ev[64]; pthread_t wd; double el;
+            if (!n_gfx || !n_rs || !n_rd || !n_re) { LOG("native render tidak lengkap\n"); return 1; }
+            if (n_aa) LOG("== nativeRequestedAA = %d\n", ((NatI0)n_aa->fn)(&g_env_head, player));
+            if (n_32) LOG("== nativeRequested32bitDisplayBuffer = %d\n", ((NatI0)n_32->fn)(&g_env_head, player) & 0xff);
+            LOG("== SDL/EGL init ...\n");
+            if (gfx_init()) return 1;
+            if (n_or) ((NatVI)n_or->fn)(&g_env_head, player, g_orient);
+            if (n_dd) ((NatVI)n_dd->fn)(&g_env_head, player, 0);
+            LOG("== nativeRecreateGfxState ...\n");
+            ((NatVP)n_gfx->fn)(&g_env_head, player, obj_new(cls_get("android/view/Surface")));
+            LOG("== nativeResize(%d,%d,1,0) ...\n", g_screen_w, g_screen_h);
+            ((NatV4)n_rs->fn)(&g_env_head, player, g_screen_w, g_screen_h, 1, 0);
+            if (n_fc) ((NatVI)n_fc->fn)(&g_env_head, player, 1);
+            LOG("== nativeResume ...\n");
+            ((NatV0)n_re->fn)(&g_env_head, player);
+            g_main_thread = pthread_self();
+            pthread_create(&wd, NULL, wd_thread, NULL); pthread_detach(wd);
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            LOG("== loop nativeRender (maks %d detik / %d frame) ...\n", g_maxsec, g_maxframes);
+            for (;;) {
+              int r, quit = 0;
+              while (sdl.PollEvent(ev)) {
+                u32 type = *(u32 *)ev;
+                if (type == 0x100) quit = 1;                              /* SDL_QUIT */
+                if (type == 0x300 && *(u32 *)(ev + 16) == 41) quit = 1;   /* ESC */
+              }
+              clock_gettime(CLOCK_MONOTONIC, &t1);
+              el = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+              if (quit || el >= g_maxsec || g_frames >= g_maxframes) break;
+              r = ((NatI0)n_rd->fn)(&g_env_head, player) & 0xff;
+              it++;
+              if (it <= 5 || it % 120 == 0) LOG("[loop] iter=%d nativeRender=%d frames=%d t=%.1fs\n", it, r, g_frames, el);
+              if (!r) { falses++; usleep(16000); }
+            }
+            LOG("== loop selesai: iter=%d frames=%d nativeRender-false=%d waktu=%.1fs\n", it, g_frames, falses, el);
+            return 0;
+          }
+
           /* ------------------------------------------------------------------ main */
           int main(int argc, char **argv) {
             const char *logpath = "m3_log.txt"; int i; Lib *lmain, *lmono, *lunity;
             for (i = 1; i < argc; i++) {
-              if (!strcmp(argv[i], "--stage") && i + 1 < argc) { const char *s = argv[++i]; g_stage = (s[0] >= '1' && s[0] <= '3') ? s[0] - '0' : 1; }
+              if (!strcmp(argv[i], "--stage") && i + 1 < argc) { const char *s = argv[++i]; g_stage = (s[0] >= '1' && s[0] <= '4') ? s[0] - '0' : 1; }
               else if (!strcmp(argv[i], "--libdir") && i + 1 < argc) snprintf(g_libdir, sizeof g_libdir, "%s", argv[++i]);
               else if (!strcmp(argv[i], "--apk") && i + 1 < argc) snprintf(g_apk, sizeof g_apk, "%s", argv[++i]);
               else if (!strcmp(argv[i], "--datadir") && i + 1 < argc) snprintf(g_datadir, sizeof g_datadir, "%s", argv[++i]);
               else if (!strcmp(argv[i], "--log") && i + 1 < argc) logpath = argv[++i];
+              else if (!strcmp(argv[i], "--maxsec") && i + 1 < argc) g_maxsec = parse_i(argv[++i]);
+              else if (!strcmp(argv[i], "--maxframes") && i + 1 < argc) g_maxframes = parse_i(argv[++i]);
+              else if (!strcmp(argv[i], "--orient") && i + 1 < argc) g_orient = parse_i(argv[++i]);
+              else if (!strcmp(argv[i], "--dump") && i + 1 < argc) parse_dump(argv[++i]);
+              else if (!strcmp(argv[i], "--size") && i + 1 < argc) { const char *z = argv[++i]; g_screen_w = parse_i(z); while (*z && *z != 'x') z++; if (*z == 'x') g_screen_h = parse_i(z + 1); }
             }
+            {
+              char rp[PATH_MAX_M];
+              if (g_apk[0] && realpath(g_apk, rp) && strlen(rp) < sizeof g_apk) snprintf(g_apk, sizeof g_apk, "%s", rp);
+              if (g_datadir[0] && realpath(g_datadir, rp) && strlen(rp) < sizeof g_datadir) snprintf(g_datadir, sizeof g_datadir, "%s", rp);
+            }
+            if (!g_ndump) parse_dump("30,150,600");
             g_log = fopen(logpath, "w");
             LOG("== m3loader (Blown Away Milestone 3) stage=%d libdir=%s apk=%s datadir=%s\n", g_stage, g_libdir, g_apk[0] ? g_apk : "(tidak ada)", g_datadir);
             init_tables(); install_crash(); preload_host();
@@ -1143,16 +1354,20 @@ jobs:
               if (nf) { LOG("== UnityPlayer.nativeFile(\"%s\") ...\n", g_apk); ((void (*)(void *, void *, void *))nf->fn)(&g_env_head, player, str_new(g_apk)); LOG("== nativeFile selesai\n"); }
               else LOG("nativeFile tidak terdaftar\n");
               summary();
+              if (g_stage >= 4) {
+                int rg = run_gfx(player);
+                LOG("== run_gfx selesai (kode %d)\n", rg);
+                summary();
+              }
             }
             LOG("== selesai tanpa crash ==\n");
             fflush(NULL);
             _exit(0);
           }
           EOF_C
-          cat > out/BlownAwayM3.sh <<'EOF_L'
+          cat > out/BlownAwayM4.sh <<'EOF_L'
           #!/bin/bash
-          # Blown Away - Milestone 3: loader ELF + shim bionic + fake JNI. 3 tahap, tiap tahap proses sendiri.
-          # Hasil: blownaway/m3_stage1.txt, m3_stage2.txt, m3_stage3.txt, m3_stdout.txt -> kirim balik ke Claude.
+          # Blown Away - Milestone 4: window SDL + EGL(SDL) + loop nativeRender. Hasil: blownaway/m4_log.txt, m4_stdout.txt, m4_frame_*.bmp
           XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
           for c in /opt/system/Tools/PortMaster /opt/tools/PortMaster "$XDG_DATA_HOME/PortMaster" /roms/ports/PortMaster /mnt/mmc/MUOS/PortMaster; do
             [ -f "$c/control.txt" ] && { controlfolder="$c"; break; }
@@ -1165,49 +1380,50 @@ jobs:
           cd "$GAMEDIR" || exit 1
 
           export LD_LIBRARY_PATH="/usr/lib32:/lib32:/usr/lib/arm-linux-gnueabihf:$LD_LIBRARY_PATH"
-          chmod +x ./m3loader
+          chmod +x ./m4loader
           mkdir -p files
-          OUT=m3_stdout.txt
+          rm -f m4_frame_*.bmp
+          OUT=m4_stdout.txt
           : > "$OUT"
           APK="$(ls ./*.apk 2>/dev/null | head -n1)"
           {
-            echo "m3 launcher $(date)"
+            echo "m4 launcher $(date)"
             echo "GAMEDIR=$GAMEDIR  APK=${APK:-TIDAK ADA}"
             echo "uname: $(uname -a)"
             for f in libmain.so libmono.so libunity.so; do
-              [ -f "libs/$f" ] && echo "libs/$f OK ($(stat -c %s "libs/$f") byte)" || echo "libs/$f TIDAK ADA  <-- salin dari lib/armeabi-v7a di APK"
+              [ -f "libs/$f" ] && echo "libs/$f OK ($(wc -c < "libs/$f") byte)" || echo "libs/$f TIDAK ADA"
             done
+            echo "SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-(default)}"
           } >> "$OUT" 2>&1
 
-          for st in 1 2 3; do
-            echo "=== stage $st ===" >> "$OUT"
-            if command -v timeout >/dev/null 2>&1; then
-              timeout 60 ./m3loader --stage $st --libdir libs --apk "$APK" --datadir files --log "m3_stage$st.txt" >> "$OUT" 2>&1
-            else
-              ./m3loader --stage $st --libdir libs --apk "$APK" --datadir files --log "m3_stage$st.txt" >> "$OUT" 2>&1
-            fi
-            echo "exit code stage $st: $?" >> "$OUT"
-            sync
-          done
+          ARGS="--stage 4 --libdir libs --apk $APK --datadir files --log m4_log.txt --maxsec 90 --dump 30,150,600"
+          if command -v timeout >/dev/null 2>&1; then
+            timeout 170 ./m4loader $ARGS >> "$OUT" 2>&1
+          else
+            ./m4loader $ARGS >> "$OUT" 2>&1
+          fi
+          echo "exit code: $?" >> "$OUT"
+          ls -l m4_frame_*.bmp >> "$OUT" 2>&1
+          sync
           sleep 1
           type pm_finish >/dev/null 2>&1 && pm_finish
           exit 0
           EOF_L
-          bash -n out/BlownAwayM3.sh
-          chmod +x out/BlownAwayM3.sh
+          bash -n out/BlownAwayM4.sh
+          chmod +x out/BlownAwayM4.sh
 
       - name: Kompilasi (armhf, glibc)
         run: |
           arm-linux-gnueabihf-gcc -O2 -Wall -Wextra -Wno-unused-parameter -Wno-cast-function-type \
             -fno-strict-aliasing -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
-            -o out/blownaway/m3loader src/m3loader.c -Wl,--no-as-needed -ldl -lpthread
-          arm-linux-gnueabihf-strip out/blownaway/m3loader
-          file out/blownaway/m3loader || true
-          arm-linux-gnueabihf-readelf -h out/blownaway/m3loader | grep -E 'Class|Machine|Flags'
+            -o out/blownaway/m4loader src/m4loader.c -Wl,--no-as-needed -ldl -lpthread
+          arm-linux-gnueabihf-strip out/blownaway/m4loader
+          file out/blownaway/m4loader || true
+          arm-linux-gnueabihf-readelf -h out/blownaway/m4loader | grep -E 'Class|Machine|Flags'
 
       - name: Cek versi glibc (device = 2.37)
         run: |
-          arm-linux-gnueabihf-readelf -V out/blownaway/m3loader | grep -o 'GLIBC_[0-9.]*' | sort -uV | tee /tmp/glibc_vers.txt
+          arm-linux-gnueabihf-readelf -V out/blownaway/m4loader | grep -o 'GLIBC_[0-9.]*' | sort -uV | tee /tmp/glibc_vers.txt
           MAXV=$(tail -n1 /tmp/glibc_vers.txt | sed 's/GLIBC_//')
           echo "GLIBC tertinggi yang dibutuhkan: $MAXV"
           if [ "$(printf '%s\n' "$MAXV" 2.37 | sort -V | tail -n1)" != "2.37" ]; then
@@ -1217,5 +1433,5 @@ jobs:
       - name: Unggah artefak
         uses: actions/upload-artifact@v4
         with:
-          name: blownaway-m3-armhf
+          name: blownaway-m4-armhf
           path: out/
