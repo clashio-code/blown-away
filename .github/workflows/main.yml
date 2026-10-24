@@ -1,16 +1,17 @@
-# Satu file, tanpa file lain di repo. Taruh sebagai .github/workflows/build-blownaway-probe.yml
-# lalu Actions > build-blownaway-probe > Run workflow. Hasil: artifact "blownaway-probe-armhf" berisi
-#   BlownAwayProbe.sh                    (launcher muOS)
-#   blownaway/elfprobe_unity             (probe ELF armhf, hanya membaca)
-#   blownaway/libs/                      (taruh libmain.so, libmono.so, libunity.so di sini)
-# Cross-compile armhf di runner x86, pola sama dengan workflow Luxor. Guard glibc <= 2.37 (device).
-name: build-blownaway-probe
+# Satu file, tanpa file lain di repo. Taruh sebagai .github/workflows/build-blownaway-probe2.yml
+# lalu Actions > build-blownaway-probe2 > Run workflow. Hasil: artifact "blownaway-probe2-armhf" berisi
+#   BlownAwayProbe2.sh                   (launcher muOS, Milestone 2)
+#   blownaway/elfprobe_jni               (probe ELF/DEX/EGL armhf + tes runtime kecil, tidak menjalankan kode game)
+# Gabungkan isi folder blownaway/ ke folder blownaway Milestone 1 (libs/ yang sama dipakai ulang).
+# Opsional: taruh classes.dex dari APK di blownaway/classes.dex agar daftar method Java (com/unity3d, org/fmod) ikut keluar.
+# Cross-compile armhf di runner x86, pola sama dengan build-blownaway-probe. Guard glibc <= 2.37 (device).
+name: build-blownaway-probe2
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - ".github/workflows/build-blownaway-probe.yml"
+      - ".github/workflows/build-blownaway-probe2.yml"
 
 jobs:
   build:
@@ -21,16 +22,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Tulis sumber (elfprobe_unity.c dan BlownAwayProbe.sh)
+      - name: Tulis sumber (elfprobe_jni.c dan BlownAwayProbe2.sh)
         run: |
-          mkdir -p src out/blownaway/libs
-          cat > src/elfprobe_unity.c <<'EOF_C'
-          /* elfprobe_unity - Milestone 1 port Blown Away (Unity 4.6.6f2 Mono, armeabi-v7a) ke muOS armhf.
-           * Diturunkan dari elfprobe milik port Luxor. HANYA MEMBACA: mem-parse libmain.so / libmono.so / libunity.so
-           * (ELF32 ARM), lalu laporkan: library yang dibutuhkan, histogram relokasi, TLS, TEXTREL, packed reloc,
-           * ekspor JNI, dan tiap simbol impor dibandingkan dengan glibc + GLESv2/EGL/zlib/SDL2 32-bit di device.
-           * Tidak menjalankan satu pun kode game.
-           * Pakai: elfprobe_unity report.txt libmain.so libmono.so libunity.so
+          mkdir -p src out/blownaway
+          cat > src/elfprobe_jni.c <<'EOF_C'
+          /* elfprobe_jni - Milestone 2 port Blown Away (Unity 4.6.6f2 Mono, armeabi-v7a) ke muOS armhf.
+           * Lanjutan elfprobe_unity. Mode default (HANYA MEMBACA + tes runtime kecil, tidak menjalankan kode game):
+           *   1. layout ELF: segmen PT_LOAD, PT_ARM_EXIDX, PT_DYNAMIC, GNU_STACK, DT_INIT_ARRAY
+           *   2. status C++ EH / unwind / dl_iterate_phdr: diimpor atau diekspor siapa
+           *   3. grup simbol Android (AAsset*, ANativeWindow*, ASensor*, OpenSL, __system_property*)
+           *   4. fungsi egl* yang dipakai libunity + string ekstensi EGL_/GL_
+           *   5. string JNI: nama kelas, signature "(...)V" beserta kandidat nama method, nama native*
+           *   6. string path/kunci (.apk, assets/bin, /proc, /sdcard, getPackageCodePath, dst)
+           *   7. parser DEX (classes.dex): method kelas com/unity3d dan org/fmod ([N]=native, [J]=Java)
+           *   8. tes runtime: mmap RWX/mprotect+eksekusi, SIGSEGV handler (+sigaltstack), pthread_kill, stack thread
+           * Mode --egl: HANYA tes EGL/GLES2 pbuffer lewat dlopen (dijalankan terpisah, bisa saja crash).
+           * Pakai: elfprobe_jni [--egl] report.txt [libmain.so libmono.so libunity.so classes.dex]
            * Catatan build: JANGAN pakai strtol/sscanf/atoi (di toolchain baru terikat ke GLIBC_2.38, device cuma 2.37). */
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -42,16 +49,20 @@ jobs:
           #include <dlfcn.h>
           #include <fcntl.h>
           #include <unistd.h>
+          #include <errno.h>
+          #include <signal.h>
+          #include <setjmp.h>
+          #include <pthread.h>
+          #include <ucontext.h>
           #include <sys/mman.h>
           #include <sys/stat.h>
           #include <sys/utsname.h>
           #include <gnu/libc-version.h>
 
           #define MAXLIB 4
-          #define MAXN 4096
-
-          #ifndef DT_RELR
-          #define DT_RELR 36
+          #define MAXLINES 700
+          #ifndef PT_ARM_EXIDX
+          #define PT_ARM_EXIDX 0x70000001
           #endif
 
           typedef struct {
@@ -67,46 +78,47 @@ jobs:
           static void P(const char *fmt, ...) {
             va_list ap;
             va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
-            if (rep) { va_start(ap, fmt); vfprintf(rep, fmt, ap); va_end(ap); }
+            if (rep) { va_start(ap, fmt); vfprintf(rep, fmt, ap); va_end(ap); fflush(rep); }
+            fflush(stdout);
           }
 
           static const char *base_name(const char *p) { const char *s = strrchr(p, '/'); return s ? s + 1 : p; }
 
-          static int load_lib(const char *path, Lib *L) {
-            struct stat st;
-            int fd, i;
+          static const uint8_t *map_file(const char *path, size_t *size) {
+            struct stat st; int fd; void *m;
+            fd = open(path, O_RDONLY);
+            if (fd < 0) return NULL;
+            if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return NULL; }
+            m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            close(fd);
+            if (m == MAP_FAILED) return NULL;
+            *size = (size_t)st.st_size;
+            return (const uint8_t *)m;
+          }
+
+          static int load_lib(const char *path, const uint8_t *m, size_t sz, Lib *L) {
+            int i;
             memset(L, 0, sizeof *L);
             snprintf(L->name, sizeof L->name, "%s", base_name(path));
-            fd = open(path, O_RDONLY);
-            if (fd < 0) { P("GAGAL membuka %s\n", path); return -1; }
-            if (fstat(fd, &st) != 0) { close(fd); return -1; }
-            L->size = (size_t)st.st_size;
-            L->map = mmap(NULL, L->size, PROT_READ, MAP_PRIVATE, fd, 0);
-            close(fd);
-            if (L->map == MAP_FAILED) { P("GAGAL mmap %s\n", path); return -1; }
-            if (L->size < sizeof(Elf32_Ehdr) || memcmp(L->map, ELFMAG, SELFMAG) != 0) { P("%s bukan file ELF\n", path); return -1; }
-            L->eh = (const Elf32_Ehdr *)L->map;
-            if (L->eh->e_ident[EI_CLASS] != ELFCLASS32 || L->eh->e_machine != EM_ARM) {
-              P("%s bukan ELF ARM 32-bit (class=%d machine=%d)\n", path, L->eh->e_ident[EI_CLASS], L->eh->e_machine);
-              return -1;
-            }
+            L->map = m; L->size = sz;
+            if (sz < sizeof(Elf32_Ehdr)) { P("%s terlalu kecil\n", path); return -1; }
+            L->eh = (const Elf32_Ehdr *)m;
+            if (L->eh->e_ident[EI_CLASS] != ELFCLASS32 || L->eh->e_machine != EM_ARM) { P("%s bukan ELF ARM 32-bit\n", path); return -1; }
             if (L->eh->e_phoff && L->eh->e_phentsize == sizeof(Elf32_Phdr) &&
-                (size_t)L->eh->e_phoff + (size_t)L->eh->e_phnum * sizeof(Elf32_Phdr) <= L->size)
-              L->ph = (const Elf32_Phdr *)(L->map + L->eh->e_phoff);
+                (size_t)L->eh->e_phoff + (size_t)L->eh->e_phnum * sizeof(Elf32_Phdr) <= sz)
+              L->ph = (const Elf32_Phdr *)(m + L->eh->e_phoff);
             if (L->eh->e_shoff == 0 || L->eh->e_shentsize != sizeof(Elf32_Shdr) ||
-                (size_t)L->eh->e_shoff + (size_t)L->eh->e_shnum * sizeof(Elf32_Shdr) > L->size) {
-              P("%s: section header tidak ada/rusak (library di-strip penuh?)\n", path); return -1;
-            }
-            L->sh = (const Elf32_Shdr *)(L->map + L->eh->e_shoff);
+                (size_t)L->eh->e_shoff + (size_t)L->eh->e_shnum * sizeof(Elf32_Shdr) > sz) { P("%s: section header tidak ada/rusak\n", path); return -1; }
+            L->sh = (const Elf32_Shdr *)(m + L->eh->e_shoff);
             for (i = 0; i < L->eh->e_shnum; i++) {
               const Elf32_Shdr *s = &L->sh[i];
-              if ((size_t)s->sh_offset + s->sh_size > L->size) continue;
+              if ((size_t)s->sh_offset + s->sh_size > sz) continue;
               if (s->sh_type == SHT_DYNSYM) {
-                L->sym = (const Elf32_Sym *)(L->map + s->sh_offset);
+                L->sym = (const Elf32_Sym *)(m + s->sh_offset);
                 L->nsym = (int)(s->sh_size / sizeof(Elf32_Sym));
-                if (s->sh_link < L->eh->e_shnum) L->str = (const char *)(L->map + L->sh[s->sh_link].sh_offset);
+                if (s->sh_link < L->eh->e_shnum) L->str = (const char *)(m + L->sh[s->sh_link].sh_offset);
               } else if (s->sh_type == SHT_DYNAMIC) {
-                L->dyn = (const Elf32_Dyn *)(L->map + s->sh_offset);
+                L->dyn = (const Elf32_Dyn *)(m + s->sh_offset);
                 L->ndyn = (int)(s->sh_size / sizeof(Elf32_Dyn));
               }
             }
@@ -114,206 +126,436 @@ jobs:
             return 0;
           }
 
-          static const char *rname(unsigned t) {
+          /* 0 = tidak ada, 1 = diimpor (UND), 2 = didefinisikan */
+          static int sym_state(const Lib *L, const char *name) {
+            int i;
+            for (i = 1; i < L->nsym; i++) {
+              const Elf32_Sym *s = &L->sym[i];
+              if (!s->st_name || strcmp(L->str + s->st_name, name) != 0) continue;
+              return s->st_shndx == SHN_UNDEF ? 1 : 2;
+            }
+            return 0;
+          }
+
+          static const char *pt_name(unsigned t) {
             switch (t) {
-              case 0: return "NONE"; case 2: return "ABS32"; case 3: return "REL32"; case 13: return "TLS_DESC";
-              case 17: return "TLS_DTPMOD32"; case 18: return "TLS_DTPOFF32"; case 19: return "TLS_TPOFF32";
-              case 20: return "COPY"; case 21: return "GLOB_DAT"; case 22: return "JUMP_SLOT"; case 23: return "RELATIVE";
-              case 160: return "IRELATIVE"; default: return "?";
+              case PT_NULL: return "NULL"; case PT_LOAD: return "LOAD"; case PT_DYNAMIC: return "DYNAMIC"; case PT_INTERP: return "INTERP";
+              case PT_NOTE: return "NOTE"; case PT_PHDR: return "PHDR"; case PT_TLS: return "TLS"; case PT_GNU_EH_FRAME: return "GNU_EH_FRAME";
+              case PT_GNU_STACK: return "GNU_STACK"; case PT_GNU_RELRO: return "GNU_RELRO"; case PT_ARM_EXIDX: return "ARM_EXIDX";
+              default: return "?";
             }
           }
 
-          static void print_structure(const Lib *L) {
-            int i, has_tls = 0, ntext_rel = 0, packed = 0;
-            unsigned cnt[256], nrela = 0, ninit = 0, nfini = 0, has_init = 0;
-            memset(cnt, 0, sizeof cnt);
+          /* ---------- 1. layout ELF ---------- */
+          static void layout_report(const Lib *L) {
+            int i; uint32_t lo = 0xffffffffu, hi = 0; unsigned nload = 0;
+            P("\n=== layout %s ===\n", L->name);
+            if (!L->ph) { P("  (tidak ada program header)\n"); return; }
+            for (i = 0; i < L->eh->e_phnum; i++) {
+              const Elf32_Phdr *p = &L->ph[i];
+              P("  %-13s off=0x%06x vaddr=0x%08x filesz=0x%07x memsz=0x%07x flags=%c%c%c align=0x%x\n", pt_name(p->p_type),
+                p->p_offset, p->p_vaddr, p->p_filesz, p->p_memsz,
+                (p->p_flags & PF_R) ? 'r' : '-', (p->p_flags & PF_W) ? 'w' : '-', (p->p_flags & PF_X) ? 'x' : '-', p->p_align);
+              if (p->p_type == PT_LOAD) {
+                nload++;
+                if (p->p_vaddr < lo) lo = p->p_vaddr;
+                if (p->p_vaddr + p->p_memsz > hi) hi = p->p_vaddr + p->p_memsz;
+              }
+              if (p->p_type == PT_ARM_EXIDX) P("    ^ tabel exidx: %u entri (8 byte), perlu didaftarkan ke unwinder (__gnu_Unwind_Find_exidx)\n", p->p_memsz / 8);
+            }
+            if (nload) P("  total span PT_LOAD: 0x%x byte (%u KB), %u segmen\n", hi - lo, (hi - lo) / 1024, nload);
             for (i = 0; i < L->ndyn; i++) {
               const Elf32_Dyn *d = &L->dyn[i];
-              switch (d->d_tag) {
-                case DT_NEEDED: P("  NEEDED %s\n", L->str + d->d_un.d_val); break;
-                case DT_SONAME: P("  SONAME %s\n", L->str + d->d_un.d_val); break;
-                case DT_TEXTREL: ntext_rel = 1; break;
-                case DT_FLAGS: if (d->d_un.d_val & DF_TEXTREL) ntext_rel = 1; break;
-                case DT_RELA: nrela = 1; break;
-                case DT_RELR: case 0x6000000f: case 0x60000011: case 0x6fffe000: packed = 1; break;
-                case DT_INIT: has_init = 1; break;
-                case DT_INIT_ARRAYSZ: ninit = d->d_un.d_val / 4; break;
-                case DT_FINI_ARRAYSZ: nfini = d->d_un.d_val / 4; break;
-                default: break;
+              if (d->d_tag == DT_INIT_ARRAY) P("  DT_INIT_ARRAY vaddr=0x%x\n", d->d_un.d_ptr);
+              if (d->d_tag == DT_INIT_ARRAYSZ) P("  DT_INIT_ARRAYSZ=%u (%u konstruktor)\n", d->d_un.d_val, d->d_un.d_val / 4);
+              if (d->d_tag == DT_FLAGS) P("  DT_FLAGS=0x%x\n", d->d_un.d_val);
+              if (d->d_tag == DT_SYMBOLIC) P("  DT_SYMBOLIC ada (simbol lib dirujuk ke dirinya dulu)\n");
+            }
+          }
+
+          /* ---------- 2. EH / unwind / simbol Android ---------- */
+          static void eh_report(const Lib *libs, int nl) {
+            static const char *const names[] = { "__cxa_throw", "__cxa_begin_catch", "__cxa_end_catch", "__cxa_allocate_exception", "__gxx_personality_v0",
+              "_Unwind_RaiseException", "_Unwind_Resume", "_Unwind_Backtrace", "__gnu_Unwind_Find_exidx", "dl_unwind_find_exidx", "dl_iterate_phdr",
+              "__aeabi_unwind_cpp_pr0", "__cxa_atexit", "__aeabi_atexit", "__cxa_finalize", "__dso_handle", "__register_frame_info", NULL };
+            int i, j, k;
+            P("\n=== C++ EH / unwind / atexit: siapa yang impor & siapa yang ekspor ===\n  (I=diimpor  D=didefinisikan  -=tidak ada)  kolom urut: ");
+            for (i = 0; i < nl; i++) P("%s ", libs[i].name);
+            P("\n");
+            for (j = 0; names[j]; j++) {
+              P("  ");
+              for (i = 0; i < nl; i++) { k = sym_state(&libs[i], names[j]); P("%c ", k == 2 ? 'D' : k == 1 ? 'I' : '-'); }
+              P(" %s\n", names[j]);
+            }
+            P("  Catatan: lib game yang memuat __cxa_throw/_Unwind_* tapi tabel exidx-nya tak terdaftar ke unwinder => crash saat exception.\n");
+          }
+
+          static int starts_with(const char *s, const char *p) { return strncmp(s, p, strlen(p)) == 0; }
+
+          static void android_groups(const Lib *libs, int nl) {
+            static const char *const grp[] = { "AAsset", "AAssetManager", "AAssetDir", "ANativeWindow", "ANativeActivity", "AndroidBitmap", "ASensor", "ALooper",
+              "AInput", "AMotion", "AKey", "AConfiguration", "SL_IID", "slCreateEngine", "__system_property", "android_", "jni", "dl_iterate", NULL };
+            int i, j, k;
+            P("\n=== grup simbol Android yang diimpor tiap lib ===\n");
+            for (i = 0; i < nl; i++) {
+              const Lib *L = &libs[i]; int any = 0;
+              P("-- %s\n", L->name);
+              for (j = 0; grp[j]; j++) {
+                int cnt = 0;
+                for (k = 1; k < L->nsym; k++) {
+                  const Elf32_Sym *s = &L->sym[k];
+                  if (s->st_shndx == SHN_UNDEF && s->st_name && starts_with(L->str + s->st_name, grp[j])) cnt++;
+                }
+                if (cnt) { P("   %-18s %d simbol\n", grp[j], cnt); any = 1; }
               }
+              if (!any) P("   (tidak ada)\n");
             }
-            if (L->ph) for (i = 0; i < L->eh->e_phnum; i++) if (L->ph[i].p_type == PT_TLS) {
-              has_tls = 1;
-              P("  PT_TLS: ukuran=%u (file=%u) align=%u  <-- relokasi TLS & __tls_get_addr perlu ditangani loader\n", L->ph[i].p_memsz, L->ph[i].p_filesz, L->ph[i].p_align);
-            }
-            for (i = 0; i < L->eh->e_shnum; i++) {
-              const Elf32_Shdr *s = &L->sh[i];
-              unsigned k, n;
-              const Elf32_Rel *r;
-              if (s->sh_type != SHT_REL || (size_t)s->sh_offset + s->sh_size > L->size) continue;
-              r = (const Elf32_Rel *)(L->map + s->sh_offset); n = s->sh_size / sizeof(Elf32_Rel);
-              for (k = 0; k < n; k++) cnt[ELF32_R_TYPE(r[k].r_info) & 0xff]++;
-            }
-            P("  init: DT_INIT=%s init_array=%u fini_array=%u\n", has_init ? "ya" : "tidak", ninit, nfini);
-            P("  TEXTREL: %s | RELA: %s | packed reloc (RELR/ANDROID_REL): %s\n", ntext_rel ? "YA (perlu mprotect saat relokasi)" : "tidak", nrela ? "YA" : "tidak", packed ? "YA (loader perlu dekoder)" : "tidak");
-            P("  PT_TLS: %s\n", has_tls ? "ada" : "tidak ada");
-            P("  histogram relokasi (yang didukung loader Luxor: RELATIVE, ABS32, GLOB_DAT, JUMP_SLOT):\n");
-            for (i = 0; i < 256; i++) if (cnt[i]) P("    %-14s (%3d) : %u%s\n", rname((unsigned)i), i, cnt[i],
-                (i == 23 || i == 2 || i == 21 || i == 22) ? "" : "   <-- BELUM didukung");
           }
 
-          static int has_export(const Lib *L, const char *name) {
-            int i;
-            for (i = 1; i < L->nsym; i++) {
-              const Elf32_Sym *s = &L->sym[i];
-              if (s->st_shndx != SHN_UNDEF && s->st_name && strcmp(L->str + s->st_name, name) == 0) return 1;
-            }
-            return 0;
-          }
-
-          static int starts_any(const char *n, const char *const *pfx) {
-            int i;
-            for (i = 0; pfx[i]; i++) if (strncmp(n, pfx[i], strlen(pfx[i])) == 0) return 1;
-            return 0;
-          }
-
-          /* ada di glibc tapi layout/ABI beda dari bionic -> perlu pembungkus */
-          static const char *const risky_pfx[] = { "pthread_", "sem_", "stat", "fstat", "lstat", "readdir", "scandir", "opendir", "closedir",
-            "setjmp", "longjmp", "_setjmp", "_longjmp", "sigsetjmp", "siglongjmp", "sigaction", "signal", "sigprocmask", "sigaltstack",
-            "dlopen", "dlsym", "dlclose", "dlerror", "dl_iterate_phdr", "getpwnam", "getpwuid", "sysconf", "fopen", "freopen", NULL };
-
-          /* pantau khusus Mono/JIT/sinyal/unwind: ini yang membuat Bogodroid crash di thread pertama */
-          static const char *const watch_pfx[] = { "dl_iterate_phdr", "dl_unwind_find_exidx", "__gnu_Unwind_Find_exidx", "_Unwind_",
-            "__cxa_throw", "__cxa_begin_catch", "__cxa_rethrow", "__aeabi_unwind", "sigaction", "sigaltstack", "signal", "pthread_kill",
-            "pthread_sigmask", "sigprocmask", "mmap", "mprotect", "madvise", "mincore", "syscall", "backtrace", "getauxval", "sched_",
-            "clone", "personality", "__tls_get_addr", "pthread_key_", "pthread_getspecific", "pthread_setspecific", NULL };
-
-          /* simbol bionic yang SUDAH ada shim-nya di loader Luxor */
-          static const char *const luxor_shim[] = { "__errno", "__android_log_print", "__android_log_write", "__assert2", "__aeabi_atexit",
-            "__register_frame_info", "__deregister_frame_info", "_Jv_RegisterClasses", "__stack_chk_guard", "__sF", "_ctype_",
-            "_tolower_tab_", "_toupper_tab_", "__srget", "__swbuf", NULL };
-
-          static const char *const gl_pfx[] = { "gl", "egl", NULL };
-
-          static void *try_open(const char *p) {
-            void *h = dlopen(p, RTLD_LAZY | RTLD_LOCAL);
-            P("  dlopen %-36s : %s\n", p, h ? "OK" : dlerror());
-            return h;
-          }
-
-          static const char *g_list_name[MAXN];
-
-          static void classify(const Lib *libs, int nl, int idx, void *hg2, void *hg1, void *he, void *hz, void *hs, void *hm) {
-            static const char *ok[MAXN], *risky[MAXN], *gl[MAXN], *shimk[MAXN], *watch[MAXN], *miss[MAXN], *other[MAXN];
-            int nok = 0, nrisky = 0, ngl = 0, nshim = 0, nwatch = 0, nmiss = 0, nother = 0, i, j, nimp = 0;
-            const Lib *L = &libs[idx];
-            (void)g_list_name;
-            P("\n=== %s: klasifikasi simbol impor ===\n", L->name);
-            for (i = 1; i < L->nsym; i++) {
-              const Elf32_Sym *s = &L->sym[i];
-              const char *n;
-              int found = 0;
-              if (s->st_shndx != SHN_UNDEF || !s->st_name) continue;
-              n = L->str + s->st_name;
-              nimp++;
-              if (starts_any(n, watch_pfx) && nwatch < MAXN) watch[nwatch++] = n;
-              for (j = 0; j < nl && !found; j++) if (j != idx && has_export(&libs[j], n)) { if (nother < MAXN) other[nother++] = n; found = 1; }
-              if (found) continue;
-              if (starts_any(n, luxor_shim) && !dlsym(RTLD_DEFAULT, n)) { if (nshim < MAXN) shimk[nshim++] = n; continue; }
-              if (strncmp(n, "__sF", 4) == 0) { if (nshim < MAXN) shimk[nshim++] = n; continue; }
-              if (dlsym(RTLD_DEFAULT, n)) { if (starts_any(n, risky_pfx)) { if (nrisky < MAXN) risky[nrisky++] = n; } else if (nok < MAXN) ok[nok++] = n; continue; }
-              if ((hg2 && dlsym(hg2, n)) || (hg1 && dlsym(hg1, n)) || (he && dlsym(he, n)) || (hz && dlsym(hz, n)) || (hs && dlsym(hs, n)) || (hm && dlsym(hm, n))) {
-                if (ngl < MAXN) gl[ngl++] = n; continue;
-              }
-              if (nmiss < MAXN) miss[nmiss++] = n;
-            }
-            P("total impor=%d | dari lib game lain=%d | ada di glibc (aman)=%d | ada di glibc tapi ABI beda=%d | shim Luxor sudah ada=%d | ada di GL/EGL/z/SDL device=%d | TIDAK ADA=%d\n",
-              nimp, nother, nok, nrisky, nshim, ngl, nmiss);
-          #define DUMP(title, arr, cnt) do { int q; P("\n-- %s (%d)\n", title, cnt); for (q = 0; q < cnt; q++) P("  %s\n", arr[q]); } while (0)
-            DUMP("PANTAU Mono/JIT/sinyal/unwind/TLS", watch, nwatch);
-            DUMP("ABI-RISK: ada di glibc tapi perlu pembungkus", risky, nrisky);
-            DUMP("SHIM LUXOR: bionic-only, sudah ada di loader Luxor", shimk, nshim);
-            DUMP("TIDAK ADA: perlu shim/implementasi baru", miss, nmiss);
-          #undef DUMP
-          }
-
-          static void gl_report(const Lib *L, void *hg2, void *hg1, void *he, void *hm) {
-            int i, total = 0, ok2 = 0, ok1 = 0;
-            P("\n=== fungsi GL/EGL yang dipakai %s ===\n  huruf: 2=libGLESv2  1=libGLESv1_CM  E=libEGL  M=libmali  (-=tidak ada)\n", L->name);
-            for (i = 1; i < L->nsym; i++) {
-              const Elf32_Sym *s = &L->sym[i];
-              const char *n;
-              int a, b, c, d;
-              if (s->st_shndx != SHN_UNDEF || !s->st_name) continue;
-              n = L->str + s->st_name;
-              if (!starts_any(n, gl_pfx)) continue;
-              a = hg2 && dlsym(hg2, n) != NULL; b = hg1 && dlsym(hg1, n) != NULL; c = he && dlsym(he, n) != NULL; d = hm && dlsym(hm, n) != NULL;
-              total++; if (a || c || d) ok2++; if (b) ok1++;
-              P("  %c%c%c%c %s\n", a ? '2' : '-', b ? '1' : '-', c ? 'E' : '-', d ? 'M' : '-', n);
-            }
-            P("ringkas: %d fungsi GL/EGL dipakai | %d tersedia di GLESv2/EGL/mali | %d tersedia di GLESv1_CM\n", total, ok2, ok1);
-          }
-
-          static void jni_report(const Lib *L) {
+          /* ---------- 4. EGL ---------- */
+          static void egl_imports(const Lib *L) {
+            static const char *const key[] = { "eglGetDisplay", "eglInitialize", "eglChooseConfig", "eglGetConfigAttrib", "eglBindAPI", "eglCreateContext",
+              "eglCreateWindowSurface", "eglCreatePbufferSurface", "eglMakeCurrent", "eglSwapBuffers", "eglSwapInterval", "eglQuerySurface", "eglQueryString",
+              "eglGetCurrentContext", "eglGetProcAddress", "eglDestroySurface", "eglDestroyContext", "eglTerminate", "eglGetError", NULL };
             int i, n = 0;
-            P("\n=== ekspor %s ===\n", L->name);
+            P("\n=== EGL di %s ===\n  fungsi kunci:\n", L->name);
+            for (i = 0; key[i]; i++) P("    %-26s %s\n", key[i], sym_state(L, key[i]) == 1 ? "DIIMPOR" : "-");
+            P("  semua egl* yang diimpor:\n");
             for (i = 1; i < L->nsym; i++) {
               const Elf32_Sym *s = &L->sym[i];
-              const char *nm;
-              if (s->st_shndx == SHN_UNDEF || !s->st_name) continue;
-              nm = L->str + s->st_name;
-              if (n < 300 || strncmp(nm, "Java_", 5) == 0 || strcmp(nm, "JNI_OnLoad") == 0) P("  %s\n", nm);
-              n++;
+              if (s->st_shndx == SHN_UNDEF && s->st_name && starts_with(L->str + s->st_name, "egl")) { P("    %s\n", L->str + s->st_name); n++; }
             }
-            P("  total simbol terekspor: %d\n", n);
+            P("  total egl*: %d\n", n);
+            P("  Tafsir: jika eglCreateContext/eglCreateWindowSurface DIIMPOR, libunity bikin context sendiri dari ANativeWindow* hasil\n");
+            P("          ANativeWindow_fromSurface. Shim harus mengembalikan EGLNativeWindowType yang valid untuk driver mali, ATAU egl* di-wrap ke SDL_GL_*.\n");
           }
 
-          int main(int argc, char **argv) {
-            Lib libs[MAXLIB];
-            struct utsname u;
-            void *hg2, *hg1, *he, *hz, *hs, *hm;
-            int i, nl = 0;
+          /* ---------- 5/6. scan string ---------- */
+          enum { C_CLS, C_SIG, C_NAT, C_PATH, C_EXT };
 
-            if (argc < 3) { fprintf(stderr, "pakai: %s report.txt lib1.so [lib2.so ...]\n", argv[0]); return 2; }
-            rep = fopen(argv[1], "w");
-            P("== elfprobe_unity (Blown Away, Unity 4.6.6f2 Mono, Milestone 1) ==\n");
-            if (uname(&u) == 0) P("device: %s %s %s\n", u.sysname, u.release, u.machine);
-            P("glibc: %s\n", gnu_get_libc_version());
+          static uint32_t g_seen[32768]; static int g_nseen;
+          static int seen_before(const char *s) {
+            uint32_t h = 2166136261u, k;
+            for (; *s; s++) { h ^= (uint8_t)*s; h *= 16777619u; }
+            h |= 1u;
+            if (g_nseen > 24000) return 0;
+            for (k = h & 32767; g_seen[k]; k = (k + 1) & 32767) if (g_seen[k] == h) return 1;
+            g_seen[k] = h; g_nseen++;
+            return 0;
+          }
 
-            dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
-            dlopen("libgcc_s.so.1", RTLD_NOW | RTLD_GLOBAL);
-            dlopen("libstdc++.so.6", RTLD_NOW | RTLD_GLOBAL);
-
-            P("\n== library 32-bit di device ==\n");
-            hg2 = try_open("/usr/lib32/libGLESv2.so.2");
-            hg1 = try_open("/usr/lib32/libGLESv1_CM.so.1");
-            he  = try_open("/usr/lib32/libEGL.so.1");
-            hm  = try_open("/usr/lib32/libmali.so");
-            hz  = try_open("/usr/lib32/libz.so.1");
-            hs  = try_open("/usr/lib32/libSDL2-2.0.so.0");
-            if (!hs) hs = try_open("libSDL2-2.0.so.0");
-            try_open("/usr/lib32/libOpenSLES.so");
-            try_open("/usr/lib32/libandroid.so");
-
-            for (i = 2; i < argc && nl < MAXLIB; i++) {
-              P("\n== %s ==\n", base_name(argv[i]));
-              if (load_lib(argv[i], &libs[nl]) != 0) continue;
-              print_structure(&libs[nl]);
-              nl++;
+          static int printable(uint8_t c) { return c >= 0x20 && c < 0x7f; }
+          static int is_ident(const char *s) {
+            size_t i, n = strlen(s);
+            if (n == 0 || n > 64 || !((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= 'a' && s[0] <= 'z') || s[0] == '_')) return 0;
+            for (i = 0; i < n; i++) if (!((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z') || (s[i] >= '0' && s[i] <= '9') || s[i] == '_' || s[i] == '$')) return 0;
+            return 1;
+          }
+          static int valid_sig(const char *s) {
+            size_t i, n = strlen(s);
+            if (n < 3 || s[0] != '(' || !strchr(s, ')')) return 0;
+            for (i = 0; i < n; i++) {
+              char c = s[i];
+              if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '/' || c == ';' || c == '[' || c == '(' || c == ')' || c == '$')) return 0;
             }
-            for (i = 0; i < nl; i++) jni_report(&libs[i]);
-            for (i = 0; i < nl; i++) classify(libs, nl, i, hg2, hg1, he, hz, hs, hm);
-            for (i = 0; i < nl; i++) if (strstr(libs[i].name, "unity")) gl_report(&libs[i], hg2, hg1, he, hm);
+            return 1;
+          }
+          static int is_class_path(const char *s) {
+            static const char *const pfx[] = { "com/unity3d/", "org/fmod/", "android/", "java/", "javax/", "dalvik/", "com/android/", "com/google/", NULL };
+            int i;
+            if (strchr(s, ' ') || strlen(s) > 120) return 0;
+            for (i = 0; pfx[i]; i++) if (starts_with(s, pfx[i])) return 1;
+            if (s[0] == 'L' && strchr(s, '/') && s[strlen(s) - 1] == ';') {
+              for (i = 0; pfx[i]; i++) if (starts_with(s + 1, pfx[i])) return 1;
+            }
+            return 0;
+          }
+          static int is_path_key(const char *s) {
+            static const char *const k[] = { ".apk", "assets/bin", "getPackageCodePath", "getPackageName", "getAssets", "/data/data", "/data/app", "/sdcard", "/storage",
+              "/proc/", "/system/", "/dev/", "ro.", "persistentDataPath", "Application", "libmono", "/mono/", "mono/", "Assembly-CSharp", "mscorlib", ".dll", ".so",
+              "getFilesDir", "getExternalFilesDir", "getCacheDir", "obb", NULL };
+            int i;
+            if (strlen(s) < 4 || strlen(s) > 140) return 0;
+            for (i = 0; k[i]; i++) if (strstr(s, k[i])) return 1;
+            return 0;
+          }
+          static int is_ext(const char *s) {
+            return starts_with(s, "EGL_") || starts_with(s, "GL_OES_") || starts_with(s, "GL_EXT_") || starts_with(s, "GL_NV_") || starts_with(s, "GL_ARM_") ||
+                   starts_with(s, "GL_KHR_") || starts_with(s, "GL_IMG_") || starts_with(s, "GL_AMD_") || starts_with(s, "GL_QCOM_") || starts_with(s, "GL_APPLE_") ||
+                   starts_with(s, "GL_ANGLE_") || starts_with(s, "GL_INTEL_");
+          }
 
+          static void scan_strings(const Lib *L, int cat, const char *title) {
+            const uint8_t *m = L->map; size_t n = L->size, i = 0, j; int lines = 0;
+            char cur[200], p1[200], p2[200], out[512];
+            p1[0] = p2[0] = 0; g_nseen = 0; memset(g_seen, 0, sizeof g_seen);
+            P("\n=== %s di %s ===\n", title, L->name);
+            while (i < n && lines < MAXLINES) {
+              size_t len;
+              if (!printable(m[i]) || (i > 0 && m[i - 1] != 0)) { i++; continue; }
+              j = i; while (j < n && printable(m[j])) j++;
+              len = j - i;
+              if (j < n && m[j] == 0 && len >= 3 && len < sizeof cur) {
+                memcpy(cur, m + i, len); cur[len] = 0;
+                out[0] = 0;
+                if (cat == C_CLS && is_class_path(cur)) snprintf(out, sizeof out, "  %s", cur);
+                else if (cat == C_SIG && valid_sig(cur)) snprintf(out, sizeof out, "  %s%s  %s   (sebelumnya: %s)", is_ident(p1) ? p1 : "?", "", cur, is_ident(p2) ? p2 : (p2[0] ? "-" : ""));
+                else if (cat == C_NAT && starts_with(cur, "native") && is_ident(cur)) snprintf(out, sizeof out, "  %s", cur);
+                else if (cat == C_PATH && is_path_key(cur) && !is_class_path(cur)) snprintf(out, sizeof out, "  %s", cur);
+                else if (cat == C_EXT && is_ext(cur)) snprintf(out, sizeof out, "  %s", cur);
+                if (out[0] && !seen_before(out)) { P("%s\n", out); lines++; }
+                memcpy(p2, p1, sizeof p2); memcpy(p1, cur, sizeof p1);
+              }
+              i = j + 1;
+            }
+            if (lines >= MAXLINES) P("  (dipotong di %d baris)\n", MAXLINES);
+          }
+
+          /* ---------- 7. DEX ---------- */
+          static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+          static uint32_t rd16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
+          static uint32_t uleb(const uint8_t **pp, const uint8_t *end) {
+            uint32_t r = 0; int sh = 0;
+            while (*pp < end && sh < 35) { uint8_t b = *(*pp)++; r |= (uint32_t)(b & 0x7f) << sh; if (!(b & 0x80)) break; sh += 7; }
+            return r;
+          }
+          static const char *dex_str(const uint8_t *m, size_t n, uint32_t idx) {
+            uint32_t cnt = rd32(m + 0x38), off = rd32(m + 0x3c), so; const uint8_t *p, *end = m + n;
+            if (idx >= cnt || (size_t)off + (size_t)(idx + 1) * 4 > n) return "?";
+            so = rd32(m + off + (size_t)idx * 4);
+            if (so >= n) return "?";
+            p = m + so; (void)uleb(&p, end);
+            return p < end ? (const char *)p : "?";
+          }
+          static const char *dex_type(const uint8_t *m, size_t n, uint32_t idx) {
+            uint32_t cnt = rd32(m + 0x40), off = rd32(m + 0x44);
+            if (idx >= cnt || (size_t)off + (size_t)(idx + 1) * 4 > n) return "?";
+            return dex_str(m, n, rd32(m + off + (size_t)idx * 4));
+          }
+
+          static void dex_report(const char *name, const uint8_t *m, size_t n) {
+            uint32_t nm, moff, poff, cdn, cdoff, i, shown = 0, nnat = 0;
+            uint8_t *isnat;
+            P("\n=== DEX %s ===\n", name);
+            if (n < 0x70) { P("  file DEX terlalu kecil\n"); return; }
+            nm = rd32(m + 0x58); moff = rd32(m + 0x5c); poff = rd32(m + 0x4c);
+            cdn = rd32(m + 0x60); cdoff = rd32(m + 0x64);
+            P("  versi=%.3s string=%u type=%u proto=%u method=%u class=%u\n", (const char *)m + 4, rd32(m + 0x38), rd32(m + 0x40), rd32(m + 0x48), nm, cdn);
+            if ((size_t)moff + (size_t)nm * 8 > n || (size_t)poff + (size_t)rd32(m + 0x48) * 12 > n) { P("  tabel method/proto di luar file\n"); return; }
+            isnat = (uint8_t *)calloc(nm ? nm : 1, 1);
+            if (!isnat) return;
+            /* class_defs: cari method native (access_flags & 0x100) */
+            for (i = 0; i < cdn && (size_t)cdoff + (size_t)(i + 1) * 32 <= n; i++) {
+              uint32_t cdata = rd32(m + cdoff + (size_t)i * 32 + 24), nf[4], k, mid = 0, g;
+              const uint8_t *p, *end = m + n;
+              if (!cdata || cdata >= n) continue;
+              p = m + cdata;
+              for (k = 0; k < 4; k++) nf[k] = uleb(&p, end);
+              for (k = 0; k < nf[0] + nf[1]; k++) { (void)uleb(&p, end); (void)uleb(&p, end); }
+              for (g = 0; g < 2; g++) {
+                mid = 0;
+                for (k = 0; k < nf[2 + g]; k++) {
+                  uint32_t diff = uleb(&p, end), acc = uleb(&p, end); (void)uleb(&p, end);
+                  mid += diff;
+                  if (mid < nm && (acc & 0x100)) { isnat[mid] = 1; nnat++; }
+                }
+              }
+            }
+            P("  total method native di seluruh DEX: %u\n", nnat);
+            P("  legenda: [N]=method native: diimplementasi di libunity (RegisterNatives / Java_*), dipanggil Java -> C++\n");
+            P("           [J]=method Java biasa: kandidat yang dipanggil libunity lewat GetMethodID/Call*Method, jadi harus ada di JNI palsu\n");
+            for (i = 0; i < nm && shown < 3000; i++) {
+              const uint8_t *mi = m + moff + (size_t)i * 8, *pr;
+              uint32_t cls = rd16(mi), proto = rd16(mi + 2), name_idx = rd32(mi + 4), params, ptn, k;
+              const char *cd = dex_type(m, n, cls);
+              char line[700]; size_t len;
+              if (!(starts_with(cd, "Lcom/unity3d/") || starts_with(cd, "Lorg/fmod/"))) continue;
+              pr = m + poff + (size_t)proto * 12;
+              params = rd32(pr + 8);
+              len = (size_t)snprintf(line, sizeof line, "  [%c] %s->%s(", isnat[i] ? 'N' : 'J', cd, dex_str(m, n, name_idx));
+              if (params && (size_t)params + 4 <= n) {
+                ptn = rd32(m + params);
+                for (k = 0; k < ptn && (size_t)params + 4 + (size_t)(k + 1) * 2 <= n && len < sizeof line - 80; k++)
+                  len += (size_t)snprintf(line + len, sizeof line - len, "%s", dex_type(m, n, rd16(m + params + 4 + (size_t)k * 2)));
+              }
+              snprintf(line + len, sizeof line - len, ")%s", dex_type(m, n, rd32(pr + 4)));
+              P("%s\n", line); shown++;
+            }
+            if (shown >= 3000) P("  (dipotong)\n");
+            free(isnat);
+          }
+
+          /* ---------- 8. tes runtime ---------- */
+          static volatile int *volatile g_nullp = (volatile int *)0x10;
+          static sigjmp_buf g_jb; static volatile int g_sig; static void *volatile g_addr, *volatile g_pc;
+          static volatile int g_usr2, g_stop; static void *volatile g_stk; static volatile size_t g_stksz;
+
+          static void segv_handler(int sig, siginfo_t *si, void *uc_) {
+            ucontext_t *uc = (ucontext_t *)uc_;
+            g_sig = sig; g_addr = si->si_addr;
+          #ifdef __arm__
+            g_pc = (void *)uc->uc_mcontext.arm_pc;
+          #else
+            (void)uc; g_pc = NULL;
+          #endif
+            siglongjmp(g_jb, 1);
+          }
+          static void usr2_handler(int s) { (void)s; g_usr2++; }
+
+          static void test_segv(int use_alt) {
+            struct sigaction sa, old; stack_t ss, oss; void *volatile altmem = NULL;
+            memset(&sa, 0, sizeof sa); sa.sa_sigaction = segv_handler; sa.sa_flags = SA_SIGINFO | SA_NODEFER | (use_alt ? SA_ONSTACK : 0); sigemptyset(&sa.sa_mask);
+            if (use_alt) {
+              altmem = malloc(65536); ss.ss_sp = altmem; ss.ss_size = 65536; ss.ss_flags = 0;
+              if (!altmem || sigaltstack(&ss, &oss) != 0) { P("  sigaltstack GAGAL: %s\n", strerror(errno)); free(altmem); return; }
+            }
+            if (sigaction(SIGSEGV, &sa, &old) != 0) { P("  sigaction(SIGSEGV) GAGAL: %s\n", strerror(errno)); return; }
+            if (sigsetjmp(g_jb, 1) == 0) { *g_nullp = 1; P("  SIGSEGV TIDAK terjadi (aneh)\n"); }
+            else P("  SIGSEGV%s tertangkap: addr=%p pc=%p  -> handler + ucontext + siglongjmp OK\n", use_alt ? " (sigaltstack)" : "", g_addr, g_pc);
+            sigaction(SIGSEGV, &old, NULL);
+            if (use_alt) { sigaltstack(&oss, NULL); free(altmem); }
+          }
+
+          static void *thr(void *a) {
+            pthread_attr_t at; void *sa = NULL; size_t ss = 0;
+            if (pthread_getattr_np(pthread_self(), &at) == 0) { pthread_attr_getstack(&at, &sa, &ss); pthread_attr_destroy(&at); }
+            g_stk = sa; g_stksz = ss;
+            while (!g_stop) usleep(1000);
+            return a;
+          }
+
+          static void runtime_tests(void) {
+            long ps = sysconf(_SC_PAGESIZE);
+            P("\n=== tes runtime (di device) ===\n  page size: %ld\n", ps);
+          #ifdef __arm__
+            {
+              uint32_t code[2] = { 0xE3A0002A, 0xE12FFF1E }; /* mov r0,#42 ; bx lr */
+              void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+              P("  mmap anonim RWX                : %s\n", p == MAP_FAILED ? strerror(errno) : "OK");
+              if (p != MAP_FAILED) {
+                memcpy(p, code, sizeof code); __builtin___clear_cache((char *)p, (char *)p + 8);
+                P("  eksekusi kode di mmap RWX      : hasil=%d (harus 42)\n", ((int (*)(void))p)());
+                munmap(p, 4096);
+              }
+              p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+              if (p != MAP_FAILED) {
+                memcpy(p, code, sizeof code);
+                if (mprotect(p, 4096, PROT_READ | PROT_EXEC) != 0) P("  mprotect RW->RX                : GAGAL %s (JIT Mono bermasalah!)\n", strerror(errno));
+                else { __builtin___clear_cache((char *)p, (char *)p + 8); P("  mprotect RW->RX + eksekusi     : hasil=%d (harus 42)\n", ((int (*)(void))p)()); }
+                munmap(p, 4096);
+              }
+            }
+          #else
+            P("  (bukan ARM: tes eksekusi kode dilewati)\n");
+          #endif
+            test_segv(0);
+            test_segv(1);
+            {
+              struct sigaction sa; pthread_t t; pthread_attr_t at; void *sp = NULL; size_t ssz = 0; int tries;
+              if (pthread_getattr_np(pthread_self(), &at) == 0) {
+                pthread_attr_getstack(&at, &sp, &ssz); pthread_attr_destroy(&at);
+                P("  pthread_getattr_np (main)      : OK stack=%p size=%lu\n", sp, (unsigned long)ssz);
+              } else P("  pthread_getattr_np (main)      : GAGAL (Mono butuh ini; biasanya karena /proc/self/maps)\n");
+              memset(&sa, 0, sizeof sa); sa.sa_handler = usr2_handler; sigemptyset(&sa.sa_mask); sigaction(SIGUSR2, &sa, NULL);
+              if (pthread_create(&t, NULL, thr, NULL) != 0) { P("  pthread_create GAGAL\n"); return; }
+              usleep(50000);
+              pthread_kill(t, SIGUSR2);
+              for (tries = 0; tries < 100 && !g_usr2; tries++) usleep(1000);
+              P("  pthread_kill(SIGUSR2) ke thread: %s (dipakai Mono untuk suspend thread)\n", g_usr2 ? "terkirim OK" : "TIDAK terkirim");
+              P("  pthread_getattr_np (thread)    : stack=%p size=%lu\n", g_stk, (unsigned long)g_stksz);
+              g_stop = 1; pthread_join(t, NULL);
+            }
+            {
+              char buf[256]; int fd = open("/proc/self/maps", O_RDONLY); ssize_t r = fd >= 0 ? read(fd, buf, sizeof buf) : -1;
+              P("  /proc/self/maps dapat dibaca   : %s\n", r > 0 ? "OK" : "TIDAK");
+              if (fd >= 0) close(fd);
+            }
+          }
+
+          /* ---------- mode --egl ---------- */
+          typedef void *(*fn_p)();
+          static void egl_test(void) {
+            void *he = dlopen("/usr/lib32/libEGL.so.1", RTLD_NOW), *hg = dlopen("/usr/lib32/libGLESv2.so.2", RTLD_NOW);
+            void *sdl = dlopen("/usr/lib32/libSDL2-2.0.so.0", RTLD_NOW);
+            long (*eglGetDisplay)(void *), (*eglInitialize)(void *, int *, int *), (*eglBindAPI)(unsigned), (*eglChooseConfig)(void *, const int *, void **, int, int *);
+            long (*eglCreateContext)(void *, void *, void *, const int *), (*eglCreatePbufferSurface)(void *, void *, const int *), (*eglMakeCurrent)(void *, void *, void *, void *);
+            long (*eglGetError)(void); const char *(*eglQueryString)(void *, int); const unsigned char *(*glGetString)(unsigned);
+            void *dpy, *cfg = NULL, *ctx, *surf; int maj = 0, min = 0, ncfg = 0;
+            int cattr[] = { 0x3040, 4, 0x3033, 1, 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3038 };
+            int xattr[] = { 0x3098, 2, 0x3038 }, pattr[] = { 0x3057, 64, 0x3056, 64, 0x3038 };
+            P("== elfprobe_jni --egl: tes EGL/GLES2 pbuffer (opt-in) ==\n");
+            P("  libEGL=%s libGLESv2=%s libSDL2=%s\n", he ? "OK" : "GAGAL", hg ? "OK" : "GAGAL", sdl ? "OK" : "tidak");
+            if (sdl) {
+              static const char *const sn[] = { "SDL_Init", "SDL_CreateWindow", "SDL_GL_CreateContext", "SDL_GL_SetAttribute", "SDL_OpenAudioDevice", "SDL_GameControllerOpen",
+                "SDL_GetWindowWMInfo", "SDL_GetCurrentVideoDriver", NULL };
+              int i; for (i = 0; sn[i]; i++) P("    SDL: %-28s %s\n", sn[i], dlsym(sdl, sn[i]) ? "ada" : "TIDAK ADA");
+            }
+            if (!he || !hg) return;
+            *(void **)&eglGetDisplay = dlsym(he, "eglGetDisplay"); *(void **)&eglInitialize = dlsym(he, "eglInitialize"); *(void **)&eglBindAPI = dlsym(he, "eglBindAPI");
+            *(void **)&eglChooseConfig = dlsym(he, "eglChooseConfig"); *(void **)&eglCreateContext = dlsym(he, "eglCreateContext");
+            *(void **)&eglCreatePbufferSurface = dlsym(he, "eglCreatePbufferSurface"); *(void **)&eglMakeCurrent = dlsym(he, "eglMakeCurrent");
+            *(void **)&eglGetError = dlsym(he, "eglGetError"); *(void **)&eglQueryString = dlsym(he, "eglQueryString"); *(void **)&glGetString = dlsym(hg, "glGetString");
+            if (!eglGetDisplay || !eglInitialize || !eglChooseConfig || !eglCreateContext || !eglMakeCurrent || !eglGetError || !eglQueryString || !glGetString) { P("  simbol EGL/GL kurang\n"); return; }
+            dpy = (void *)eglGetDisplay(NULL);
+            P("  eglGetDisplay(DEFAULT)  : %p\n", dpy);
+            if (!dpy) return;
+            if (!eglInitialize(dpy, &maj, &min)) { P("  eglInitialize GAGAL err=0x%lx (mungkin butuh display dari SDL/KMSDRM)\n", eglGetError()); return; }
+            P("  eglInitialize OK versi %d.%d\n  EGL_VENDOR : %s\n  EGL_VERSION: %s\n  EGL_EXT    : %s\n", maj, min, eglQueryString(dpy, 0x3053), eglQueryString(dpy, 0x3054), eglQueryString(dpy, 0x3055));
+            if (eglBindAPI) P("  eglBindAPI(GLES)        : %ld\n", eglBindAPI(0x30A0));
+            if (!eglChooseConfig(dpy, cattr, &cfg, 1, &ncfg) || ncfg < 1) { P("  eglChooseConfig(ES2+pbuffer) 0 config err=0x%lx\n", eglGetError()); return; }
+            P("  eglChooseConfig OK (%d)\n", ncfg);
+            ctx = (void *)eglCreateContext(dpy, cfg, NULL, xattr);
+            P("  eglCreateContext(ES2)   : %p err=0x%lx\n", ctx, eglGetError());
+            if (!ctx || !eglCreatePbufferSurface) return;
+            surf = (void *)eglCreatePbufferSurface(dpy, cfg, pattr);
+            P("  eglCreatePbufferSurface : %p err=0x%lx\n", surf, eglGetError());
+            if (!surf) return;
+            if (!eglMakeCurrent(dpy, surf, surf, ctx)) { P("  eglMakeCurrent GAGAL err=0x%lx\n", eglGetError()); return; }
+            P("  eglMakeCurrent OK\n  GL_VENDOR  : %s\n  GL_RENDERER: %s\n  GL_VERSION : %s\n  GL_EXT     : %s\n",
+              (const char *)glGetString(0x1F00), (const char *)glGetString(0x1F01), (const char *)glGetString(0x1F02), (const char *)glGetString(0x1F03));
+          }
+
+          /* ---------- main ---------- */
+          int main(int argc, char **argv) {
+            Lib libs[MAXLIB]; struct utsname u; int i, nl = 0, ai = 1, egl_only = 0, uidx = -1;
+            if (argc > 1 && strcmp(argv[1], "--egl") == 0) { egl_only = 1; ai = 2; }
+            if (argc < ai + 1) { fprintf(stderr, "pakai: %s [--egl] report.txt [lib.so ...] [classes.dex]\n", argv[0]); return 2; }
+            rep = fopen(argv[ai], "w"); ai++;
+            if (egl_only) { egl_test(); P("\n== selesai ==\n"); if (rep) fclose(rep); return 0; }
+            P("== elfprobe_jni (Blown Away, Unity 4.6.6f2 Mono, Milestone 2) ==\n");
+            if (uname(&u) == 0) P("device: %s %s %s\nglibc: %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
+            runtime_tests();
+            for (i = ai; i < argc; i++) {
+              size_t sz = 0; const uint8_t *m = map_file(argv[i], &sz);
+              if (!m) { P("\nGAGAL membuka %s\n", argv[i]); continue; }
+              if (sz > 8 && memcmp(m, "dex\n", 4) == 0) { dex_report(base_name(argv[i]), m, sz); continue; }
+              if (nl < MAXLIB && load_lib(argv[i], m, sz, &libs[nl]) == 0) { if (strstr(libs[nl].name, "unity")) uidx = nl; nl++; }
+            }
+            for (i = 0; i < nl; i++) layout_report(&libs[i]);
+            if (nl) { eh_report(libs, nl); android_groups(libs, nl); }
+            if (uidx >= 0) {
+              egl_imports(&libs[uidx]);
+              scan_strings(&libs[uidx], C_EXT, "string ekstensi EGL_/GL_");
+              scan_strings(&libs[uidx], C_CLS, "nama kelas JNI");
+              scan_strings(&libs[uidx], C_NAT, "kandidat method native* (RegisterNatives)");
+              scan_strings(&libs[uidx], C_SIG, "signature JNI + kandidat nama method (nama = string tepat sebelum signature, heuristik)");
+              scan_strings(&libs[uidx], C_PATH, "string path/kunci");
+            }
+            for (i = 0; i < nl; i++) {
+              if (i == uidx) continue;
+              scan_strings(&libs[i], C_CLS, "nama kelas JNI");
+              scan_strings(&libs[i], C_SIG, "signature JNI + kandidat nama method");
+            }
             P("\n== selesai ==\n");
             if (rep) fclose(rep);
             return 0;
           }
           EOF_C
-          cat > out/BlownAwayProbe.sh <<'EOF_SH'
+          cat > out/BlownAwayProbe2.sh <<'EOF_SH'
           #!/bin/bash
-          # Probe Blown Away (Unity 4.6.6f2 Mono, armeabi-v7a), Milestone 1. Hanya membaca, tidak mengubah apa pun.
-          # Pola launcher sama dengan LuxorProbe.sh: folder data dicari di /$directory/ports/blownaway
+          # Probe Blown Away Milestone 2 (JNI, EGL, DEX, tes runtime). Hanya membaca + tes kecil, tidak menjalankan kode game.
+          # Folder data sama dengan Milestone 1: /$directory/ports/blownaway (libs/ sudah berisi libmain.so libmono.so libunity.so)
+          # Opsional: taruh classes.dex dari APK di blownaway/classes.dex (unzip -j game.apk classes.dex)
 
           XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
 
@@ -334,46 +576,59 @@ jobs:
           [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/blownaway"
 
           cd "$GAMEDIR" || {
-            echo "folder blownaway tidak ketemu. Dicari di: /$directory/ports/blownaway dan di sebelah script ini." > "$(dirname "$0")/probe_error.txt"
+            echo "folder blownaway tidak ketemu. Dicari di: /$directory/ports/blownaway dan di sebelah script ini." > "$(dirname "$0")/probe2_error.txt"
             exit 1
           }
 
           export LD_LIBRARY_PATH="/usr/lib32:/lib32:${LD_LIBRARY_PATH}"
-          chmod +x ./elfprobe_unity 2>/dev/null
+          chmod +x ./elfprobe_jni 2>/dev/null
 
-          echo "GAMEDIR=$GAMEDIR" > probe_stdout.txt
+          echo "GAMEDIR=$GAMEDIR" > probe2_stdout.txt
           for f in libmain.so libmono.so libunity.so; do
             if [ ! -f "libs/$f" ]; then
-              echo "libs/$f belum ada di $GAMEDIR/libs" > probe_report.txt
+              echo "libs/$f belum ada di $GAMEDIR/libs" > probe2_report.txt
               sleep 3
               exit 1
             fi
           done
 
-          ./elfprobe_unity probe_report.txt libs/libmain.so libs/libmono.so libs/libunity.so >> probe_stdout.txt 2>&1
-          echo "exit code: $?" >> probe_stdout.txt
+          EXTRA=""
+          [ -f classes.dex ] && EXTRA="classes.dex"
+          [ -z "$EXTRA" ] && echo "classes.dex tidak ada: bagian DEX dilewati" >> probe2_stdout.txt
+
+          # Tahap 1: statik + tes runtime (report disimpan baris per baris, aman kalau crash di tengah)
+          ./elfprobe_jni probe2_report.txt libs/libmain.so libs/libmono.so libs/libunity.so $EXTRA >> probe2_stdout.txt 2>&1
+          echo "exit code tahap 1: $?" >> probe2_stdout.txt
+
+          # Tahap 2: tes EGL/GLES2 pbuffer, terpisah karena bisa crash/hang di driver
+          if command -v timeout >/dev/null 2>&1; then
+            timeout 20 ./elfprobe_jni --egl probe2_egl_report.txt >> probe2_stdout.txt 2>&1
+          else
+            ./elfprobe_jni --egl probe2_egl_report.txt >> probe2_stdout.txt 2>&1
+          fi
+          echo "exit code tahap 2 (egl): $?" >> probe2_stdout.txt
+
           sleep 2
           type pm_finish >/dev/null 2>&1 && pm_finish
           EOF_SH
-          bash -n out/BlownAwayProbe.sh
-          echo "Taruh libmain.so, libmono.so, libunity.so (dari lib/armeabi-v7a di APK) di folder ini. Jangan di-upload ke GitHub." > out/blownaway/libs/TARUH-LIB-DI-SINI.txt
+          bash -n out/BlownAwayProbe2.sh
 
-      - name: Kompilasi elfprobe_unity (armhf)
+      - name: Kompilasi elfprobe_jni (armhf)
         run: |
-          arm-linux-gnueabihf-gcc -O2 -Wall -Wextra -o out/blownaway/elfprobe_unity src/elfprobe_unity.c -ldl
-          file out/blownaway/elfprobe_unity || true
+          arm-linux-gnueabihf-gcc -O2 -Wall -Wextra -o out/blownaway/elfprobe_jni src/elfprobe_jni.c -ldl -lpthread
+          file out/blownaway/elfprobe_jni || true
           echo "--- library yang dibutuhkan:"
-          arm-linux-gnueabihf-readelf -d out/blownaway/elfprobe_unity | grep NEEDED
-          MAXV=$(arm-linux-gnueabihf-readelf -V out/blownaway/elfprobe_unity | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+          arm-linux-gnueabihf-readelf -d out/blownaway/elfprobe_jni | grep NEEDED
+          MAXV=$(arm-linux-gnueabihf-readelf -V out/blownaway/elfprobe_jni | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
           echo "butuh GLIBC tertinggi: $MAXV (device: 2.37)"
           if [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
             echo "GAGAL: butuh glibc lebih baru dari 2.37. Simbol penyebab:"
-            arm-linux-gnueabihf-nm -D --undefined-only out/blownaway/elfprobe_unity | grep -E 'GLIBC_2\.(3[89]|[4-9][0-9])'
+            arm-linux-gnueabihf-nm -D --undefined-only out/blownaway/elfprobe_jni | grep -E 'GLIBC_2\.(3[89]|[4-9][0-9])'
             exit 1
           fi
 
       - name: Unggah hasil build
         uses: actions/upload-artifact@v4
         with:
-          name: blownaway-probe-armhf
+          name: blownaway-probe2-armhf
           path: out
