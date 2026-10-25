@@ -1,12 +1,12 @@
-name: Build Blown Away M4b (armhf)
+name: Build Blown Away M4c (armhf)
 
 # Milestone 4b (M4 + penelusuran akses file + penangkap crash m4loader): window SDL2 + EGL dibungkus ke SDL + loop nativeRender (dump frame ke BMP).
-# Jalankan manual: tab Actions -> "Build Blown Away M4b (armhf)" -> Run workflow.
+# Jalankan manual: tab Actions -> "Build Blown Away M4c (armhf)" -> Run workflow.
 on:
   workflow_dispatch:
   push:
     paths:
-      - '.github/workflows/build-blownaway-m4b.yml'
+      - '.github/workflows/build-blownaway-m4c.yml'
 
 jobs:
   build:
@@ -21,7 +21,7 @@ jobs:
         run: |
           mkdir -p src out/blownaway
           cat > src/m4loader.c <<'EOF_C'
-          /* m4loader (dasar: m3loader, Milestone 3 + 4b) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
+          /* m4loader (dasar: m3loader, Milestone 3 + 4c) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
            * Isi: loader ELF ARM buatan sendiri (libmain/libmono/libunity tidak bisa di-dlopen glibc), shim bionic->glibc,
            *      fake JNIEnv/JavaVM yang mencatat semua permintaan, crash handler yang menunjuk lib+offset.
            * Pakai: m3loader --stage N --libdir DIR --apk FILE --datadir DIR --log FILE
@@ -116,26 +116,79 @@ jobs:
           }
 
           /* ------------------------------------------------------------------ crash handler */
+          static __thread u32 t_fn;
+          static char g_maps[1 << 18]; static int g_maps_len;
+          static void maps_load(void) {
+            int fd = open("/proc/self/maps", O_RDONLY); g_maps_len = 0;
+            if (fd < 0) { g_maps[0] = 0; return; }
+            for (;;) {
+              ssize_t n = read(fd, g_maps + g_maps_len, sizeof g_maps - 1 - (size_t)g_maps_len);
+              if (n <= 0) break;
+              g_maps_len += (int)n;
+              if (g_maps_len >= (int)sizeof g_maps - 1) break;
+            }
+            close(fd); g_maps[g_maps_len] = 0;
+          }
+          static u32 hex8(const char **pp) {
+            const char *p = *pp; u32 v = 0;
+            for (;; p++) { char c = *p; int d; if (c >= '0' && c <= '9') d = c - '0'; else if (c >= 'a' && c <= 'f') d = c - 'a' + 10; else break; v = v * 16 + (u32)d; }
+            *pp = p; return v;
+          }
+          static int maps_find(u32 a, char *perms, char *name, u32 *off) {
+            const char *p = g_maps;
+            while (*p) {
+              const char *q = p, *ps; u32 st, en, fo; int k;
+              st = hex8(&q); if (*q == '-') q++;
+              en = hex8(&q); if (*q == ' ') q++;
+              memcpy(perms, q, 4); perms[4] = 0; q += 4; if (*q == ' ') q++;
+              fo = hex8(&q);
+              for (k = 0; k < 2; k++) { while (*q == ' ') q++; while (*q && *q != ' ' && *q != '\n') q++; }
+              while (*q == ' ') q++;
+              ps = q; while (*q && *q != '\n') q++;
+              if (a >= st && a < en) {
+                size_t n = (size_t)(q - ps); if (n > 200) n = 200;
+                memcpy(name, ps, n); name[n] = 0; *off = a - st + fo; return 1;
+              }
+              p = (*q == '\n') ? q + 1 : q;
+            }
+            return 0;
+          }
+          /* tulis anotasi alamat; return 1 bila alamat ada di wilayah executable */
+          static int annot(u32 a, char *buf, size_t n) {
+            u32 off; const char *l = addr2lib(a, &off); char perms[8], nm[256]; u32 fo;
+            buf[0] = 0;
+            if (l[0] != '?') { snprintf(buf, n, "%s+0x%x", l, off); return 1; }
+            if (maps_find(a, perms, nm, &fo)) {
+              const char *b = strrchr(nm, '/'); Dl_info di; const char *sym = ""; u32 so = 0;
+              b = b ? b + 1 : nm;
+              if (dladdr(PTR(a), &di) && di.dli_sname) { sym = di.dli_sname; so = a - U32(di.dli_saddr); }
+              snprintf(buf, n, "%s %s+0x%x [%s] fileoff=0x%x", b, sym, so, perms, fo);
+              return perms[2] == 'x';
+            }
+            return 0;
+          }
           static void dump_regs(const char *tag, int sig, siginfo_t *si, void *ucv) {
-            u32 pc = 0, lr = 0, sp = 0, o1, o2, i;
-            const char *n1, *n2;
-            (void)ucv;
+            u32 pc = 0, lr = 0, sp = 0, i; int shown = 0; char b1[400];
+            (void)ucv; (void)i; (void)shown; (void)b1;
+            maps_load();
           #ifdef __arm__
             {
-              ucontext_t *uc = (ucontext_t *)ucv;
-              pc = uc->uc_mcontext.arm_pc; lr = uc->uc_mcontext.arm_lr; sp = uc->uc_mcontext.arm_sp;
-              LOG("  r0=%08lx r1=%08lx r2=%08lx r3=%08lx r4=%08lx r5=%08lx\n", uc->uc_mcontext.arm_r0, uc->uc_mcontext.arm_r1,
-                  uc->uc_mcontext.arm_r2, uc->uc_mcontext.arm_r3, uc->uc_mcontext.arm_r4, uc->uc_mcontext.arm_r5);
+              ucontext_t *uc = (ucontext_t *)ucv; struct sigcontext *m = &uc->uc_mcontext;
+              pc = m->arm_pc; lr = m->arm_lr; sp = m->arm_sp;
+              LOG("  r0=%08lx r1=%08lx r2=%08lx r3=%08lx r4=%08lx r5=%08lx\n  r6=%08lx r7=%08lx r8=%08lx r9=%08lx r10=%08lx fp=%08lx ip=%08lx\n",
+                  m->arm_r0, m->arm_r1, m->arm_r2, m->arm_r3, m->arm_r4, m->arm_r5, m->arm_r6, m->arm_r7, m->arm_r8, m->arm_r9, m->arm_r10, m->arm_fp, m->arm_ip);
             }
           #endif
-            n1 = addr2lib(pc, &o1); n2 = addr2lib(lr, &o2);
-            LOG("\n*** %s sinyal=%d fault_addr=%p\n    pc=%08x (%s+0x%x)\n    lr=%08x (%s+0x%x)\n    sp=%08x\n", tag, sig, si ? si->si_addr : NULL,
-                pc, n1, o1, lr, n2, o2, sp);
+            LOG("\n*** %s sinyal=%d fault_addr=%p tid=%d\n", tag, sig, si ? si->si_addr : NULL, (int)syscall(SYS_gettid));
+            annot(pc, b1, sizeof b1); LOG("    pc=%08x  %s\n", pc, b1);
+            annot(lr, b1, sizeof b1); LOG("    lr=%08x  %s\n", lr, b1);
+            if (t_fn) { annot(t_fn, b1, sizeof b1); LOG("    fungsi awal thread ini: %s\n", b1); } else LOG("    (thread utama atau thread bukan buatan game)\n");
+            LOG("    sp=%08x\n", sp);
             if (sp) {
-              LOG("    tumpukan (alamat yang menunjuk ke lib game):\n");
-              for (i = 0; i < 192; i++) {
-                u32 w = ((u32 *)PTR(sp))[i], o; const char *n = addr2lib(w, &o);
-                if (n[0] != '?') LOG("      [sp+%u] %08x (%s+0x%x)\n", i * 4, w, n, o);
+              LOG("    tumpukan (kata yang menunjuk ke kode):\n");
+              for (i = 0; i < 400 && shown < 40; i++) {
+                u32 w = ((u32 *)PTR(sp))[i];
+                if (annot(w, b1, sizeof b1)) { LOG("      [sp+%u] %08x  %s\n", i * 4, w, b1); shown++; }
               }
             }
           }
@@ -351,8 +404,20 @@ jobs:
             pthread_attr_t *a = calloc(1, sizeof *a); int r;
             pthread_attr_init(a); r = pthread_getattr_np(t, a); *(u32 *)g = U32(a); return r;
           }
+          typedef struct { void *(*fn)(void *); void *arg; } TStart;
+          static void *thread_tramp(void *p) {
+            TStart t = *(TStart *)p; stack_t ss; u32 o; const char *l;
+            free(p);
+            ss.ss_sp = malloc(65536); ss.ss_size = 65536; ss.ss_flags = 0;
+            if (ss.ss_sp) sigaltstack(&ss, NULL);
+            t_fn = U32((void *)t.fn);
+            l = addr2lib(t_fn, &o);
+            LOG("[THREAD] tid=%d mulai, fungsi=%s+0x%x\n", (int)syscall(SYS_gettid), l, o);
+            return t.fn(t.arg);
+          }
           static int shim_pthread_create(pthread_t *t, void *attr, void *(*fn)(void *), void *arg) {
-            return pthread_create(t, attr ? aget(attr) : NULL, fn, arg);
+            TStart *ts = malloc(sizeof *ts); ts->fn = fn; ts->arg = arg;
+            return pthread_create(t, attr ? aget(attr) : NULL, thread_tramp, ts);
           }
           static int shim_pthread_kill(pthread_t t, int sig) { return pthread_kill(t, msig(sig)); }
           typedef struct { u32 prev; void (*routine)(void *); void *arg; } BCleanup;
@@ -387,8 +452,30 @@ jobs:
             for (s = 1; s <= 31; s++) if (sigismember(h, s) == 1) m |= 1u << (s - 1);
             return m;
           }
+          static BSigaction g_gh[65]; static int g_gh_set[65], g_sig_events;
+          static int is_crash_sig(int s) { return s == SIGSEGV || s == SIGBUS || s == SIGILL || s == SIGFPE; }
+          static void chain_handler(int sig, siginfo_t *si, void *ucv) {
+            BSigaction *h = &g_gh[sig];
+            if (g_sig_events++ < 12) dump_regs("SINYAL diterima (diteruskan ke handler game)", sig, si, ucv);
+            if (h->flags & 4) ((void (*)(int, siginfo_t *, void *))PTR(h->handler))(sig, si, ucv);
+            else ((void (*)(int))PTR(h->handler))(sig);
+          }
           static int shim_sigaction(int sig, const BSigaction *act, BSigaction *old) {
             struct sigaction a, o; int r;
+            if (sig > 0 && sig < 65 && is_crash_sig(sig)) {
+              if (!act && old && g_gh_set[sig]) { *old = g_gh[sig]; return 0; }
+              if (act && act->handler >= 2) {
+                u32 off; const char *ln = addr2lib(act->handler, &off);
+                if (strcmp(ln, "libunity.so")) {
+                  if (old) { if (g_gh_set[sig]) *old = g_gh[sig]; else memset(old, 0, sizeof *old); }
+                  g_gh[sig] = *act; g_gh_set[sig] = 1;
+                  LOG("[SHIM] sigaction(%d): handler game %s+0x%x dipasang lewat penangkap m4loader (log dulu, lalu teruskan)\n", sig, ln, off);
+                  memset(&a, 0, sizeof a);
+                  a.sa_sigaction = chain_handler; a.sa_flags = act->flags | SA_SIGINFO | SA_ONSTACK; bmask2host(act->mask, &a.sa_mask);
+                  return sigaction(sig, &a, NULL);
+                }
+              }
+            }
             memset(&a, 0, sizeof a); memset(&o, 0, sizeof o);
             if (act && (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE || sig == SIGABRT || sig == SIGTRAP)) {
               u32 off; const char *ln = addr2lib(act->handler, &off);
@@ -1461,5 +1548,5 @@ jobs:
       - name: Unggah artefak
         uses: actions/upload-artifact@v4
         with:
-          name: blownaway-m4b-armhf
+          name: blownaway-m4c-armhf
           path: out/
