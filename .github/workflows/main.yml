@@ -1,8 +1,8 @@
-name: Build Blown Away M4j (armhf, self-contained)
+name: Build Blown Away M4k (armhf, self-contained)
 
-# Milestone 4j - basis M4j + shim pthread_{get,set}schedparam (handle TID bionic) + stub AMotionEvent_getFlags.
+# Milestone 4k - basis M4j + _ctype_/_tolower_tab_/_toupper_tab_ sebagai POINTER (layout bionic lama).
 # SELF-CONTAINED: source m4loader.c di-embed di sini, tidak perlu file lain di repo.
-# Jalankan manual: tab Actions -> "Build Blown Away M4j (armhf, self-contained)" -> Run workflow.
+# Jalankan manual: tab Actions -> "Build Blown Away M4k (armhf, self-contained)" -> Run workflow.
 #
 # CATATAN: file ini menggantikan workflow M4e lama (build-blownaway-m4e.yml).
 # Workflow M4e lama gagal karena mencoba membaca build-blownaway-m4d.yml dari repo.
@@ -28,8 +28,14 @@ jobs:
         run: |
           mkdir -p src out/blownaway
           cat > src/m4loader.c <<'EOF_C'
-          /* m4loader (M4j) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
+          /* m4loader (M4k) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
            * Basis: M4g (fix JNI String.equals + hook libunity).
+           * Perubahan M4k (crash M4j: ldrb [r3+1] di libunity+0x395138, fault_addr=0x2020200b):
+           *  bionic lama mendefinisikan _ctype_, _tolower_tab_, _toupper_tab_ sebagai POINTER ke tabel
+           *      (const char *_ctype_ = _C_ctype_), bukan array. Kode game: ldr r2,[GOT]; ldr r2,[r2] -> isi
+           *      pointer. M4j mengekspor alamat array langsung, jadi 4 byte pertama tabel (00 20 20 20 =
+           *      0x20202000) terbaca sebagai pointer tabel -> isspace()/isdigit() crash. Sekarang diekspor
+           *      alamat variabel pointer.
            * Perubahan M4j (crash M4i: pthread_getschedparam(TID) -> SIGSEGV, fault_addr=TID+offset):
            *  (a) shim pthread_getschedparam/setschedparam/setschedprio/setaffinity_np/getaffinity_np:
            *      handle TID bionic dipetakan ke pthread_t glibc (real_pt) sebelum diteruskan.
@@ -359,6 +365,7 @@ jobs:
           static uint8_t shim_sF[3 * 84 + 16] __attribute__((aligned(8)));
           static uint8_t shim_ctype[257];
           static int16_t shim_tolower[257], shim_toupper[257];
+          static const char *shim_ctype_p; static const int16_t *shim_tolower_p, *shim_toupper_p;
           static int shim_herrno;
           static char g_fake_window[64], g_fake_sensor[64];
 
@@ -379,6 +386,7 @@ jobs:
               shim_toupper[c + 1] = (int16_t)((c >= 'a' && c <= 'z') ? c - 32 : c);
             }
             shim_tolower[0] = shim_toupper[0] = -1;
+          shim_ctype_p = (const char *)shim_ctype; shim_tolower_p = shim_tolower; shim_toupper_p = shim_toupper;
           }
 
           static int *shim_errno_loc(void) { return &errno; }
@@ -535,7 +543,7 @@ jobs:
             }
             pthread_attr_init(a); r = pthread_getattr_np(real, a); *(u32 *)g = U32(a); return r;
           }
-          /* M4j: handle bionic (TID) -> pthread_t glibc. 0 bila tidak dikenal. */
+          /* M4k: handle bionic (TID) -> pthread_t glibc. 0 bila tidak dikenal. */
           static pthread_t real_pt(pthread_t t) {
             if (handle_is_tid((void *)t)) {
               int tid = (int)(uintptr_t)t;
@@ -617,7 +625,7 @@ jobs:
           static void *shim_pthread_self(void) { return (void *)(uintptr_t)shim_gettid(); }
           static int shim_pthread_equal(void *a, void *b) { return a == b; }
           static int shim_pthread_yield(void) { return sched_yield(); }
-          /* glibc tidak punya pthread_isjoined/pthread_isdetached (M4j: sebelumnya link error) */
+          /* glibc tidak punya pthread_isjoined/pthread_isdetached (M4k: sebelumnya link error) */
           static int shim_pthread_isjoined(void *h) { (void)h; return 0; }
           static int shim_pthread_isdetached(void *h) { (void)h; return 0; }
           static int shim_pthread_join(void *h, void **ret) {
@@ -1158,8 +1166,8 @@ jobs:
           #define SH(n, f) { n, (void *)(f) }
           static const Shim g_shims[] = {
             SH("__errno", shim_errno_loc), SH("__get_h_errno", shim_get_h_errno), SH("__page_size", &shim_page_size),
-            SH("__stack_chk_guard", &shim_guard), SH("__sF", shim_sF), SH("_ctype_", shim_ctype), SH("_tolower_tab_", shim_tolower),
-            SH("_toupper_tab_", shim_toupper), SH("gettid", shim_gettid), SH("tkill", shim_tkill), SH("bsd_signal", shim_bsd_signal),
+            SH("__stack_chk_guard", &shim_guard), SH("__sF", shim_sF), SH("_ctype_", &shim_ctype_p), SH("_tolower_tab_", &shim_tolower_p),
+            SH("_toupper_tab_", &shim_toupper_p), SH("gettid", shim_gettid), SH("tkill", shim_tkill), SH("bsd_signal", shim_bsd_signal),
             SH("stat", shim_stat), SH("lstat", shim_lstat), SH("fstat", shim_fstat), SH("readdir", shim_readdir), SH("sysconf", shim_sysconf),
             SH("strlcpy", shim_strlcpy),
             SH("pthread_mutex_init", shim_mutex_init), SH("pthread_mutex_destroy", shim_mutex_destroy), SH("pthread_mutex_lock", shim_mutex_lock),
@@ -1892,7 +1900,7 @@ jobs:
             }
             if (!g_ndump) parse_dump("30,150,600");
             g_log = fopen(logpath, "w");
-            LOG("== m4loader (Blown Away Milestone 4j) stage=%d libdir=%s apk=%s datadir=%s\n", g_stage, g_libdir, g_apk[0] ? g_apk : "(tidak ada)", g_datadir);
+            LOG("== m4loader (Blown Away Milestone 4k) stage=%d libdir=%s apk=%s datadir=%s\n", g_stage, g_libdir, g_apk[0] ? g_apk : "(tidak ada)", g_datadir);
             init_tables(); install_crash(); preload_host(); thmap_add(shim_gettid(), pthread_self());
             g_run_init = g_stage >= 2;
             if (g_stage >= 2) jni_init();
@@ -1935,9 +1943,9 @@ jobs:
             _exit(0);
           }
           EOF_C
-          cat > out/BlownAwayM4j.sh <<'EOF_L'
+          cat > out/BlownAwayM4k.sh <<'EOF_L'
           #!/bin/bash
-          # Blown Away - Milestone 4j: handler crash Unity dirantai + pthread semantik bionic + stub glue Android.
+          # Blown Away - Milestone 4k: handler crash Unity dirantai + pthread semantik bionic + stub glue Android.
           # Hasil: blownaway/m4_log.txt, m4_stdout.txt, m4_frame_*.bmp
           XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
           for c in /opt/system/Tools/PortMaster /opt/tools/PortMaster "$XDG_DATA_HOME/PortMaster" /roms/ports/PortMaster /mnt/mmc/MUOS/PortMaster; do
@@ -1958,7 +1966,7 @@ jobs:
           : > "$OUT"
           APK="$(ls ./*.apk 2>/dev/null | head -n1)"
           {
-            echo "m4j launcher $(date)"
+            echo "m4k launcher $(date)"
             echo "GAMEDIR=$GAMEDIR  APK=${APK:-TIDAK ADA}"
             echo "uname: $(uname -a)"
             for f in libmain.so libmono.so libunity.so; do
@@ -1980,8 +1988,8 @@ jobs:
           type pm_finish >/dev/null 2>&1 && pm_finish
           exit 0
           EOF_L
-          bash -n out/BlownAwayM4j.sh
-          chmod +x out/BlownAwayM4j.sh
+          bash -n out/BlownAwayM4k.sh
+          chmod +x out/BlownAwayM4k.sh
 
       - name: Kompilasi (armhf, glibc)
         run: |
@@ -2004,5 +2012,5 @@ jobs:
       - name: Unggah artefak
         uses: actions/upload-artifact@v4
         with:
-          name: blownaway-m4j-armhf
+          name: blownaway-m4k-armhf
           path: out/
