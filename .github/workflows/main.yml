@@ -1,8 +1,8 @@
-name: Build Blown Away M4n (armhf, self-contained)
+name: Build Blown Away M5 (armhf, self-contained)
 
-# Milestone 4l - basis M4k + perbaiki signature stub android_native_app_glue (getSensorList/pollAll/getEvent).
+# Milestone 5 - basis M4n (gambar sudah tampil): + audio FMOD->SDL, + input pad->sentuhan (kursor virtual).
 # SELF-CONTAINED: source m4loader.c di-embed di sini, tidak perlu file lain di repo.
-# Jalankan manual: tab Actions -> "Build Blown Away M4l (armhf, self-contained)" -> Run workflow.
+# Jalankan manual: tab Actions -> "Build Blown Away M5 (armhf, self-contained)" -> Run workflow.
 #
 # CATATAN: file ini menggantikan workflow M4e lama (build-blownaway-m4e.yml).
 # Workflow M4e lama gagal karena mencoba membaca build-blownaway-m4d.yml dari repo.
@@ -28,8 +28,17 @@ jobs:
         run: |
           mkdir -p src out/blownaway
           cat > src/m4loader.c <<'EOF_C'
-          /* m4loader (M4l) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
+          /* m4loader (M5) - port Blown Away (ditambah audio FMOD->SDL dan input pad->sentuhan; lihat catatan M5 di bawah). Dasar M4l - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
            * Basis: M4g (fix JNI String.equals + hook libunity).
+           * Perubahan M5 (dasar: M4n yang sudah menampilkan gambar):
+           *  (1) AUDIO: FMOD di libunity memakai jalur Java (org.fmod.FMODAudioDevice -> AudioTrack). Loader meniru thread Java itu:
+           *      thread audio memanggil fmodGetInfo(0..3) (rate, panjang blok, jumlah blok, info3) lalu fmodProcess(ByteBuffer) berulang
+           *      dan menyuapkan PCM16 stereo ke SDL_QueueAudio. Opsi: --no-audio, --audio-ch N (default 2).
+           *  (2) INPUT: game Unity ini berbasis sentuhan. Pad dipetakan ke kursor virtual + sentuhan lewat UnityPlayer.nativeInjectEvent
+           *      dengan objek MotionEvent/KeyEvent palsu (fake JNI menjawab getAction/getX/getY/dst). D-pad/stik kiri = gerak kursor,
+           *      A atau B = sentuh/tahan(seret), L = pelan, R = cepat, Start(tap) = tombol Back. Select+Start tetap keluar.
+           *      Kursor digambar dengan glScissor+glClear (tanpa shader) sebelum eglSwapBuffers.
+           *  (3) JNI IsInstanceOf kini membedakan MotionEvent/KeyEvent (sebelumnya selalu 1).
            * Perubahan M4l (crash M4k: fault_addr=0x2, pc=m4loader stub, di dalam nativeRender pertama):
            *  shim_ASensorManager_getSensorList salah signature. NDK: int ASensorManager_getSensorList(mgr, list**)
            *      (2 argumen). Stub M4h/M4k memakai (m, t, int *n) dan menulis *n=0; r2 (sisa register = 2) dianggap
@@ -998,15 +1007,23 @@ jobs:
             void (*GetWindowSize)(void *, int *, int *); int (*PollEvent)(void *); const char *(*GetCurrentVideoDriver)(void);
             int (*InitSubSystem)(unsigned); int (*NumJoysticks)(void); void *(*JoystickOpen)(int); const char *(*JoystickName)(void *);
             int (*IsGameController)(int); void *(*GameControllerOpen)(int);
+            unsigned (*OpenAudioDevice)(const char *, int, const void *, void *, int); void (*PauseAudioDevice)(unsigned, int);
+            int (*QueueAudio)(unsigned, const void *, unsigned); unsigned (*GetQueuedAudioSize)(unsigned); void (*CloseAudioDevice)(unsigned);
           } sdl;
+          static int g_audio_ch = 2, g_noaudio = 0;
           static char g_egl_dpy[16], g_egl_cfg[16], g_egl_surf[16];
           static int g_egl_logged;
+          static void pad_dispatch(u32 type, const unsigned char *ev);
+          static void draw_cursor(void);
+          static void audio_sdl_init(void);
+          static void cursor_gl_init(void);
           /* ---- M4n: controller + keluar dengan Select+Start (atau tombol Guide/Menu) ----
            * Layout event SDL2 32-bit: type@0, which@8, button@12, state@13. SDL_CONTROLLER_BUTTON_BACK=4, GUIDE=5, START=6.
            * Joystick mentah (device tanpa mapping controller): kombinasi --quit-raw a,b (default 6,7). Semua tombol dicatat di log. */
           static int g_btn_back, g_btn_start, g_pad_log, g_pad_gc, g_raw_a = 6, g_raw_b = 7, g_raw_da, g_raw_db;
           static void pad_init(void) {
             int i, n;
+            audio_sdl_init();
             if (!sdl.InitSubSystem || sdl.InitSubSystem(0x200u | 0x2000u)) { LOG("[pad] init joystick/controller gagal: %s\n", sdl.GetError()); return; }
             n = sdl.NumJoysticks ? sdl.NumJoysticks() : 0;
             LOG("[pad] joystick terdeteksi: %d\n", n);
@@ -1020,6 +1037,7 @@ jobs:
           }
           static void pad_event(const unsigned char *ev, int *quit) {
             u32 t = *(const u32 *)ev;
+            pad_dispatch(t, ev);
             if (t == 0x100) *quit = 1;                                         /* SDL_QUIT */
             else if (t == 0x300 && *(const u32 *)(ev + 16) == 41) *quit = 1;   /* ESC */
             else if (t == 0x651 || t == 0x652) {                               /* controller button down/up */
@@ -1100,6 +1118,7 @@ jobs:
           static unsigned shim_eglSwapBuffers(void *d, void *s) {
             int i, n = g_frames + 1; (void)d; (void)s;
             for (i = 0; i < g_ndump; i++) if (g_dump[i] == n) dump_frame(n);
+            draw_cursor();
             sdl.GL_SwapWindow(g_win);
             g_frames = n;
             if (n <= 3 || n % 300 == 0) LOG("[GFX] eglSwapBuffers #%d\n", n);
@@ -1123,6 +1142,9 @@ jobs:
             *(void **)&sdl.InitSubSystem = dlsym(h, "SDL_InitSubSystem"); *(void **)&sdl.NumJoysticks = dlsym(h, "SDL_NumJoysticks");
             *(void **)&sdl.JoystickOpen = dlsym(h, "SDL_JoystickOpen"); *(void **)&sdl.JoystickName = dlsym(h, "SDL_JoystickName");
             *(void **)&sdl.IsGameController = dlsym(h, "SDL_IsGameController"); *(void **)&sdl.GameControllerOpen = dlsym(h, "SDL_GameControllerOpen");
+            *(void **)&sdl.OpenAudioDevice = dlsym(h, "SDL_OpenAudioDevice"); *(void **)&sdl.PauseAudioDevice = dlsym(h, "SDL_PauseAudioDevice");
+            *(void **)&sdl.QueueAudio = dlsym(h, "SDL_QueueAudio"); *(void **)&sdl.GetQueuedAudioSize = dlsym(h, "SDL_GetQueuedAudioSize");
+            *(void **)&sdl.CloseAudioDevice = dlsym(h, "SDL_CloseAudioDevice");
             if (sdl.Init(0x20 /*VIDEO*/)) { LOG("[GFX] SDL_Init gagal: %s\n", sdl.GetError()); return 1; }
             LOG("[GFX] SDL video driver: %s\n", sdl.GetCurrentVideoDriver() ? sdl.GetCurrentVideoDriver() : "?");
             for (tries = 0; tries < 2; tries++) {
@@ -1140,6 +1162,7 @@ jobs:
             sdl.GL_SetSwapInterval(1);
             LOG("[GFX] ukuran jendela %dx%d\n", g_screen_w, g_screen_h);
             pad_init();
+            cursor_gl_init();
             {
               const char *(*gs)(unsigned) = (const char *(*)(unsigned))sdl.GL_GetProcAddress("glGetString");
               if (gs) LOG("[GFX] GL_RENDERER=%s GL_VERSION=%s\n", gs(0x1F01), gs(0x1F02));
@@ -1572,7 +1595,19 @@ jobs:
           static JField *jni_GetFieldID(void *env, JObj *c, const char *n, const char *s) { (void)env; return field_get(c, n, s, 0); }
           static JField *jni_GetStaticFieldID(void *env, JObj *c, const char *n, const char *s) { (void)env; return field_get(c, n, s, 1); }
           static JObj *jni_GetObjectClass(void *env, JObj *o) { (void)env; return (o && o->cls) ? o->cls : cls_get("java/lang/Object"); }
-          static int jni_IsInstanceOf(void *env, void *o, void *c) { (void)env; (void)o; (void)c; return 1; }
+          /* M5: objek event input palsu (MotionEvent/KeyEvent) membawa struct InEv di JObj.data, ditandai esz == EV_MAGIC. */
+          typedef struct { int is_key; int action; int keycode; float x, y; long long t_down, t_event; int source; } InEv;
+          #define EV_MAGIC 0x45564e54
+          static InEv *ev_of(JObj *o) { return (o && o->esz == EV_MAGIC) ? (InEv *)o->data : NULL; }
+          static JObj *ev_new(const InEv *src) {
+            JObj *o = obj_new(cls_get(src->is_key ? "android/view/KeyEvent" : "android/view/MotionEvent")); InEv *e = malloc(sizeof *e);
+            *e = *src; o->data = e; o->esz = EV_MAGIC; return o;
+          }
+          static int jni_IsInstanceOf(void *env, JObj *o, JObj *c) {
+            InEv *e = ev_of(o); (void)env;
+            if (e && c && c->cname) { if (!strcmp(c->cname, "android/view/InputEvent")) return 1; return strcmp(o->cname, c->cname) == 0; }
+            return 1;
+          }
 
           /* nilai balik string "pintar" untuk method/field yang sering ditanya Unity */
           static const char *special_string(const char *name, JObj *thiz) {
@@ -1602,6 +1637,18 @@ jobs:
             if (c <= 3 || (c & (c - 1)) == 0) LOG("[JNI] Call%s %s.%s%s (#%d)\n", m->is_static ? "Static" : "", m->cls ? m->cls->cname : "?", m->name, m->sig, c);
             if (!strcmp(m->name, "triggerResizeCall") || !strcmp(m->name, "setScreenSize")) g_resize_pending = 1;
             rs = strrchr(m->sig, ')'); if (!rs) return 0; rs++;
+            { InEv *ev = ev_of(thiz);
+              if (ev && rs[0] != 'L' && rs[0] != 'F' && rs[0] != 'J') {
+                const char *n = m->name;
+                if (!strcmp(n, "getAction")) return (u32)ev->action;
+                if (!strcmp(n, "getKeyCode")) return (u32)ev->keycode;
+                if (!strcmp(n, "getPointerCount")) return 1;
+                if (!strcmp(n, "getDeviceId")) return 1;
+                if (!strcmp(n, "getSource")) return (u32)ev->source;
+                if (!strcmp(n, "getToolType")) return 1;   /* TOOL_TYPE_FINGER */
+                return 0;                                    /* getPointerId, getMetaState, getRepeatCount, getButtonState, getHistorySize, getFlags, ... */
+              }
+            }
             if (rs[0] == 'Z' && !strcmp(m->name, "equals")) {
               u32 eq = (thiz && arg0 && thiz->str && arg0->str) ? (strcmp(thiz->str, arg0->str) == 0) : (thiz == arg0);
               if (m->ncalls <= 3) LOG("[JNI]   equals(\"%s\", \"%s\") = %u\n", thiz && thiz->str ? thiz->str : "?", arg0 && arg0->str ? arg0->str : "?", eq);
@@ -1632,8 +1679,22 @@ jobs:
           static u32 jni_CallI(void *env, JObj *o, JMeth *m, ...) { va_list ap; JObj *a; (void)env; va_start(ap, m); a = va_arg(ap, JObj *); va_end(ap); return call_core(m, o, a); }
           static u32 jni_CallI_V(void *env, JObj *o, JMeth *m, va_list ap) { JObj *a = va_arg(ap, JObj *); (void)env; return call_core(m, o, a); }
           static u32 jni_CallI_A(void *env, JObj *o, JMeth *m, const u32 *args) { (void)env; return call_core(m, o, args ? (JObj *)PTR(args[0]) : NULL); }
-          static long long jni_CallJ(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o, NULL); return 0; }
-          static float jni_CallF(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o, NULL); return (m && !strcmp(m->name, "getRefreshRate")) ? 60.0f : 0.0f; }
+          static long long jni_CallJ(void *env, JObj *o, JMeth *m, ...) {
+            InEv *ev = ev_of(o); (void)env; (void)call_core(m, o, NULL);
+            if (ev && m) { if (!strcmp(m->name, "getDownTime")) return ev->t_down; return ev->t_event; }
+            return 0;
+          }
+          static float jni_CallF(void *env, JObj *o, JMeth *m, ...) {
+            InEv *ev = ev_of(o); (void)env; (void)call_core(m, o, NULL);
+            if (ev && m) {
+              if (!strcmp(m->name, "getX") || !strcmp(m->name, "getRawX") || !strcmp(m->name, "getHistoricalX")) return ev->x;
+              if (!strcmp(m->name, "getY") || !strcmp(m->name, "getRawY") || !strcmp(m->name, "getHistoricalY")) return ev->y;
+              if (!strcmp(m->name, "getPressure") || !strcmp(m->name, "getHistoricalPressure")) return 1.0f;
+              if (!strcmp(m->name, "getSize") || !strcmp(m->name, "getHistoricalSize")) return 0.1f;
+              return 0.0f;   /* getAxisValue dll */
+            }
+            return (m && !strcmp(m->name, "getRefreshRate")) ? 60.0f : 0.0f;
+          }
           static double jni_CallD(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o, NULL); return 0.0; }
           static void jni_CallV(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o, NULL); }
           static JObj *jni_NewObject(void *env, JObj *c, JMeth *m, ...) {
@@ -1881,6 +1942,167 @@ jobs:
           #endif
           }
 
+
+          /* ================================================================== M5: pad -> sentuhan, kursor, audio FMOD ====== */
+          static Native *g_n_inject; static JObj *g_player_obj;
+          static float g_cx = 320.0f, g_cy = 240.0f;
+          static int g_cursor_on, g_touch_down, g_dp[4], g_lx, g_ly, g_slow, g_fast, g_start_dn, g_touch_btn[2];
+          static long long g_t_down;
+          static long long now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000; }
+          static void inject_event(const InEv *e) {
+            JObj *o; int r; static int n;
+            if (!g_n_inject || !g_player_obj) return;
+            o = ev_new(e);
+            r = ((int (*)(void *, void *, void *))g_n_inject->fn)(&g_env_head, g_player_obj, o) & 0xff;
+            if (n++ < 60) LOG("[input] %s action=%d x=%.0f y=%.0f key=%d -> nativeInjectEvent=%d\n", e->is_key ? "KEY" : "TOUCH", e->action, e->x, e->y, e->keycode, r);
+          }
+          static void touch_event(int action) {
+            InEv e; memset(&e, 0, sizeof e);
+            e.action = action; e.x = g_cx; e.y = g_cy; e.t_event = now_ms();
+            if (action == 0) g_t_down = e.t_event;
+            e.t_down = g_t_down; e.source = 0x1002; /* SOURCE_TOUCHSCREEN */
+            inject_event(&e);
+          }
+          static void key_event(int action, int code) {
+            InEv e; memset(&e, 0, sizeof e);
+            e.is_key = 1; e.action = action; e.keycode = code; e.t_event = now_ms(); e.t_down = e.t_event; e.source = 0x101; /* SOURCE_KEYBOARD */
+            inject_event(&e);
+          }
+          static void touch_press(int dn) {
+            if (dn && !g_touch_down) { g_touch_down = 1; g_cursor_on = 1; touch_event(0); }
+            else if (!dn && g_touch_down) { g_touch_down = 0; touch_event(1); }
+          }
+          static void pad_dispatch(u32 t, const unsigned char *ev) {
+            if (t == 0x651 || t == 0x652) {                         /* tombol controller */
+              int dn = (t == 0x651), b = ev[12];
+              if (b == 0 || b == 1) { g_touch_btn[b] = dn; g_cursor_on = 1; touch_press(g_touch_btn[0] || g_touch_btn[1]); }
+              else if (b >= 11 && b <= 14) { g_dp[b - 11] = dn; g_cursor_on = 1; }   /* atas, bawah, kiri, kanan */
+              else if (b == 9) g_slow = dn;
+              else if (b == 10) g_fast = dn;
+              else if (b == 6) {                                    /* Start: tap = Back (kecuali bersama Select = keluar) */
+                if (dn) g_start_dn = 1;
+                else { if (g_start_dn && !g_btn_back) { key_event(0, 4); key_event(1, 4); } g_start_dn = 0; }
+              }
+            } else if (t == 0x650) {                                /* sumbu controller */
+              int ax = ev[12], v = *(const int16_t *)(ev + 16);
+              if (ax == 0) g_lx = v; else if (ax == 1) g_ly = v;
+              if (v > 8000 || v < -8000) g_cursor_on = 1;
+            } else if (!g_pad_gc) {                                 /* joystick mentah (tanpa mapping controller) */
+              if (t == 0x603 || t == 0x604) {
+                int dn = (t == 0x603), b = ev[12];
+                if (b == 0 || b == 1) { g_touch_btn[b] = dn; g_cursor_on = 1; touch_press(g_touch_btn[0] || g_touch_btn[1]); }
+              } else if (t == 0x602) {
+                int v = ev[13]; g_dp[0] = !!(v & 1); g_dp[3] = !!(v & 2); g_dp[1] = !!(v & 4); g_dp[2] = !!(v & 8); g_cursor_on = 1;
+              } else if (t == 0x600) {
+                int ax = ev[12], v = *(const int16_t *)(ev + 16);
+                if (ax == 0) g_lx = v; else if (ax == 1) g_ly = v;
+                if (v > 8000 || v < -8000) g_cursor_on = 1;
+              }
+            }
+          }
+          static void pad_update(void) {
+            float sp = 5.0f, dx = 0.0f, dy = 0.0f;
+            if (g_fast) sp *= 2.5f;
+            if (g_slow) sp *= 0.35f;
+            if (g_dp[0]) dy -= 1.0f;
+            if (g_dp[1]) dy += 1.0f;
+            if (g_dp[2]) dx -= 1.0f;
+            if (g_dp[3]) dx += 1.0f;
+            if (g_lx > 8000 || g_lx < -8000) dx += (float)g_lx / 32768.0f;
+            if (g_ly > 8000 || g_ly < -8000) dy += (float)g_ly / 32768.0f;
+            if (dx == 0.0f && dy == 0.0f) return;
+            g_cx += dx * sp; g_cy += dy * sp;
+            if (g_cx < 0.0f) g_cx = 0.0f;
+            if (g_cy < 0.0f) g_cy = 0.0f;
+            if (g_cx > (float)(g_screen_w - 1)) g_cx = (float)(g_screen_w - 1);
+            if (g_cy > (float)(g_screen_h - 1)) g_cy = (float)(g_screen_h - 1);
+            g_cursor_on = 1;
+            if (g_touch_down) touch_event(2);                       /* ACTION_MOVE saat ditahan */
+          }
+
+          /* kursor tanpa shader: gunting + glClear, lalu pulihkan state yang diubah */
+          static struct {
+            void (*Enable)(unsigned); void (*Disable)(unsigned); void (*Scissor)(int, int, int, int); void (*ClearColor)(float, float, float, float);
+            void (*Clear)(unsigned); void (*GetIntegerv)(unsigned, int *); void (*GetFloatv)(unsigned, float *); unsigned char (*IsEnabled)(unsigned);
+            void (*ColorMask)(unsigned char, unsigned char, unsigned char, unsigned char); void (*GetBooleanv)(unsigned, unsigned char *);
+          } gl;
+          static void cursor_gl_init(void) {
+          #define G(f, n) *(void **)&gl.f = sdl.GL_GetProcAddress(n)
+            G(Enable, "glEnable"); G(Disable, "glDisable"); G(Scissor, "glScissor"); G(ClearColor, "glClearColor"); G(Clear, "glClear");
+            G(GetIntegerv, "glGetIntegerv"); G(GetFloatv, "glGetFloatv"); G(IsEnabled, "glIsEnabled"); G(ColorMask, "glColorMask"); G(GetBooleanv, "glGetBooleanv");
+          #undef G
+            LOG("[cursor] fungsi GL %s\n", (gl.Clear && gl.Scissor && gl.GetIntegerv) ? "siap" : "TIDAK lengkap (kursor tidak digambar)");
+          }
+          static void cur_rect(int x, int y, int w, int h, float c) { gl.Scissor(x, y, w, h); gl.ClearColor(c, c, c, 1.0f); gl.Clear(0x4000); }
+          static void draw_cursor(void) {
+            int fb = 0, sb[4], cx, cy; float cc[4]; unsigned char sc, cm[4];
+            if (!g_cursor_on || !gl.Clear || !gl.Scissor || !gl.GetIntegerv || !gl.GetFloatv || !gl.IsEnabled || !gl.GetBooleanv || !gl.ColorMask) return;
+            gl.GetIntegerv(0x8CA6, &fb);                            /* GL_FRAMEBUFFER_BINDING: hanya gambar di framebuffer layar */
+            if (fb) return;
+            cx = (int)g_cx; cy = g_screen_h - 1 - (int)g_cy;
+            sc = gl.IsEnabled(0x0C11); gl.GetIntegerv(0x0C10, sb); gl.GetFloatv(0x0C22, cc); gl.GetBooleanv(0x0C23, cm);
+            gl.Enable(0x0C11); gl.ColorMask(1, 1, 1, 1);
+            cur_rect(cx - 9, cy - 2, 19, 5, 0.0f); cur_rect(cx - 2, cy - 9, 5, 19, 0.0f);
+            cur_rect(cx - 8, cy - 1, 17, 3, g_touch_down ? 0.9f : 1.0f); cur_rect(cx - 1, cy - 8, 3, 17, g_touch_down ? 0.9f : 1.0f);
+            gl.ClearColor(cc[0], cc[1], cc[2], cc[3]); gl.Scissor(sb[0], sb[1], sb[2], sb[3]);
+            if (!sc) gl.Disable(0x0C11);
+            gl.ColorMask(cm[0], cm[1], cm[2], cm[3]);
+          }
+
+          /* ---- audio: meniru thread Java org.fmod.FMODAudioDevice ---- */
+          static volatile int g_audio_stop;
+          static void audio_sdl_init(void) {
+            const char *(*cur)(void); int r;
+            if (!sdl.InitSubSystem) return;
+            r = sdl.InitSubSystem(0x10u /*AUDIO*/);
+            *(void **)&cur = dlsym(RTLD_DEFAULT, "SDL_GetCurrentAudioDriver");
+            LOG("[audio] SDL_InitSubSystem(AUDIO) -> %d driver=%s%s%s\n", r, (r == 0 && cur && cur()) ? cur() : "?", r ? " galat: " : "", r ? sdl.GetError() : "");
+          }
+          static int audio_open(int rate, int blk, unsigned *dev) {
+            unsigned char want[24], have[24]; int samples = 256; unsigned d;
+            memset(want, 0, sizeof want); memset(have, 0, sizeof have);
+            while (samples < blk && samples < 4096) samples <<= 1;
+            *(int *)want = rate; *(uint16_t *)(want + 4) = 0x8010 /*AUDIO_S16LSB*/; want[6] = (unsigned char)g_audio_ch; *(uint16_t *)(want + 8) = (uint16_t)samples;
+            d = sdl.OpenAudioDevice(NULL, 0, want, have, 0);
+            if (!d) { LOG("[audio] SDL_OpenAudioDevice gagal: %s\n", sdl.GetError()); return 1; }
+            LOG("[audio] perangkat SDL dibuka id=%u: diminta %dHz ch=%d samples=%d, didapat %dHz ch=%d samples=%d\n", d, rate, g_audio_ch, samples,
+                *(int *)have, have[6], *(uint16_t *)(have + 8));
+            sdl.PauseAudioDevice(d, 0);
+            *dev = d;
+            return 0;
+          }
+          static void *audio_thread(void *arg) {
+            JObj *self = (JObj *)arg;
+            Native *ni = find_native("FMODAudioDevice", "fmodGetInfo"), *np = find_native("FMODAudioDevice", "fmodProcess");
+            int rate, blk, nb, i3, bytes = 0, polls = 0, nproc = 0, ch = g_audio_ch; unsigned dev = 0; uint8_t *mem = NULL; JObj *bufobj = NULL;
+            if (!ni || !np) { LOG("[audio] native FMOD tidak terdaftar, audio dimatikan\n"); return NULL; }
+            if (!sdl.OpenAudioDevice || !sdl.QueueAudio || !sdl.GetQueuedAudioSize || !sdl.PauseAudioDevice) { LOG("[audio] SDL audio tidak tersedia, audio dimatikan\n"); return NULL; }
+            while (!g_audio_stop) {
+              unsigned q; int r, i, peak = 0;
+              if (!dev) {
+                rate = ((int (*)(void *, void *, int))ni->fn)(&g_env_head, self, 0);
+                blk = ((int (*)(void *, void *, int))ni->fn)(&g_env_head, self, 1);
+                nb = ((int (*)(void *, void *, int))ni->fn)(&g_env_head, self, 2);
+                i3 = ((int (*)(void *, void *, int))ni->fn)(&g_env_head, self, 3);
+                if (rate <= 0 || blk <= 0) { if ((polls++ % 40) == 0) LOG("[audio] FMOD belum siap (rate=%d blok=%d), menunggu...\n", rate, blk); usleep(50000); continue; }
+                LOG("[audio] FMOD siap: rate=%d panjang-blok=%d jumlah-blok=%d info3=%d (kanal diasumsikan %d)\n", rate, blk, nb, i3, ch);
+                if (rate < 8000 || rate > 96000 || blk < 32 || blk > 16384) { LOG("[audio] nilai tidak masuk akal, coba lagi nanti\n"); usleep(200000); continue; }
+                if (audio_open(rate, blk, &dev)) return NULL;
+                bytes = blk * ch * 2;
+                mem = calloc(1, (size_t)bytes + 64);
+                bufobj = jni_NewDirectByteBuffer(NULL, mem, bytes);
+              }
+              q = sdl.GetQueuedAudioSize(dev);
+              if (q >= (unsigned)bytes * 4u) { usleep(2000); continue; }
+              r = ((int (*)(void *, void *, void *))np->fn)(&g_env_head, self, bufobj);
+              for (i = 0; i < bytes / 2; i += 4) { int v = ((int16_t *)mem)[i]; if (v < 0) v = -v; if (v > peak) peak = v; }
+              nproc++;
+              if (nproc <= 6 || nproc % 1000 == 0) LOG("[audio] blok #%d fmodProcess=%d puncak=%d antrean=%u\n", nproc, r, peak, q);
+              if (r >= 0) sdl.QueueAudio(dev, mem, (unsigned)bytes); else usleep(5000);
+            }
+            return NULL;
+          }
+
           static int run_gfx(JObj *player) {
             Native *n_aa = find_native("UnityPlayer", "nativeRequestedAA"), *n_32 = find_native("UnityPlayer", "nativeRequested32bitDisplayBuffer");
             Native *n_or = find_native("UnityPlayer", "nativeDeviceOrientation"), *n_dd = find_native("UnityPlayer", "nativeSetDefaultDisplay");
@@ -1908,6 +2130,9 @@ jobs:
             ((NatV0)n_re->fn)(&g_env_head, player);
             g_main_thread = pthread_self();
             pthread_create(&wd, NULL, wd_thread, NULL); pthread_detach(wd);
+            g_player_obj = player; g_n_inject = find_native("UnityPlayer", "nativeInjectEvent");
+            LOG("[input] nativeInjectEvent %s\n", g_n_inject ? "siap" : "TIDAK terdaftar");
+            if (!g_noaudio) { pthread_t at; if (pthread_create(&at, NULL, audio_thread, obj_new(cls_get("org/fmod/FMODAudioDevice"))) == 0) pthread_detach(at); }
             clock_gettime(CLOCK_MONOTONIC, &t0);
             LOG("== loop nativeRender (maks %d detik / %d frame) ...\n", g_maxsec, g_maxframes);
             for (;;) {
@@ -1916,6 +2141,7 @@ jobs:
               clock_gettime(CLOCK_MONOTONIC, &t1);
               el = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
               if (quit || el >= g_maxsec || g_frames >= g_maxframes) break;
+              pad_update();
               r = ((NatI0)n_rd->fn)(&g_env_head, player) & 0xff;
               if (g_resize_pending) {
                 static int nrs;
@@ -1927,6 +2153,7 @@ jobs:
               if (it <= 5 || it % 120 == 0) LOG("[loop] iter=%d nativeRender=%d frames=%d t=%.1fs\n", it, r, g_frames, el);
               if (!r) { falses++; usleep(16000); }
             }
+            g_audio_stop = 1;
             LOG("== loop selesai: iter=%d frames=%d nativeRender-false=%d waktu=%.1fs\n", it, g_frames, falses, el);
             return 0;
           }
@@ -1942,6 +2169,8 @@ jobs:
               else if (!strcmp(argv[i], "--log") && i + 1 < argc) logpath = argv[++i];
               else if (!strcmp(argv[i], "--quit-raw") && i + 1 < argc) { const char *q = argv[++i]; g_raw_a = parse_i(q); while (*q && *q != ',') q++; if (*q == ',') g_raw_b = parse_i(q + 1); }
               else if (!strcmp(argv[i], "--maxsec") && i + 1 < argc) g_maxsec = parse_i(argv[++i]);
+              else if (!strcmp(argv[i], "--no-audio")) g_noaudio = 1;
+              else if (!strcmp(argv[i], "--audio-ch") && i + 1 < argc) { g_audio_ch = parse_i(argv[++i]); if (g_audio_ch < 1 || g_audio_ch > 8) g_audio_ch = 2; }
               else if (!strcmp(argv[i], "--maxframes") && i + 1 < argc) g_maxframes = parse_i(argv[++i]);
               else if (!strcmp(argv[i], "--orient") && i + 1 < argc) g_orient = parse_i(argv[++i]);
               else if (!strcmp(argv[i], "--dump") && i + 1 < argc) parse_dump(argv[++i]);
@@ -1999,9 +2228,10 @@ jobs:
             _exit(0);
           }
           EOF_C
-          cat > out/BlownAwayM4l.sh <<'EOF_L'
+          cat > out/BlownAwayM5.sh <<'EOF_L'
           #!/bin/bash
-          # Blown Away - Milestone 4l: handler crash Unity dirantai + pthread semantik bionic + stub glue Android.
+          # Blown Away - Milestone 5: audio FMOD->SDL + input pad->sentuhan (kursor). Select+Start = keluar.
+          # Kontrol: D-pad/stik kiri = gerak kursor, A/B = sentuh (tahan = seret), L = pelan, R = cepat, Start = Back, Select+Start = keluar.
           # Hasil: blownaway/m4_log.txt, m4_stdout.txt, m4_frame_*.bmp
           XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
           for c in /opt/system/Tools/PortMaster /opt/tools/PortMaster "$XDG_DATA_HOME/PortMaster" /roms/ports/PortMaster /mnt/mmc/MUOS/PortMaster; do
@@ -2024,7 +2254,7 @@ jobs:
           : > "$OUT"
           APK="$(ls ./*.apk 2>/dev/null | head -n1)"
           {
-            echo "m4l launcher $(date)"
+            echo "m5 launcher $(date)"
             echo "GAMEDIR=$GAMEDIR  APK=${APK:-TIDAK ADA}"
             echo "uname: $(uname -a)"
             for f in libmain.so libmono.so libunity.so; do
@@ -2033,9 +2263,9 @@ jobs:
             echo "SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-(default)}"
           } >> "$OUT" 2>&1
 
-          ARGS="--stage 4 --libdir libs --apk $APK --datadir files --log m4_log.txt --maxsec 90 --dump 30,150,600 --hooks"
+          ARGS="--stage 4 --libdir libs --apk $APK --datadir files --log m4_log.txt --maxsec 1800 --dump 60,900 --hooks"
           if command -v timeout >/dev/null 2>&1; then
-            timeout 170 ./m4loader $ARGS >> "$OUT" 2>&1
+            timeout 1900 ./m4loader $ARGS >> "$OUT" 2>&1
           else
             ./m4loader $ARGS >> "$OUT" 2>&1
           fi
@@ -2046,8 +2276,8 @@ jobs:
           type pm_finish >/dev/null 2>&1 && pm_finish
           exit 0
           EOF_L
-          bash -n out/BlownAwayM4l.sh
-          chmod +x out/BlownAwayM4l.sh
+          bash -n out/BlownAwayM5.sh
+          chmod +x out/BlownAwayM5.sh
 
       - name: Kompilasi (armhf, glibc)
         run: |
@@ -2070,5 +2300,5 @@ jobs:
       - name: Unggah artefak
         uses: actions/upload-artifact@v4
         with:
-          name: blownaway-m4l-armhf
+          name: blownaway-m5-armhf
           path: out/
