@@ -1,8 +1,8 @@
-name: Build Blown Away M4h (armhf, self-contained)
+name: Build Blown Away M4i (armhf, self-contained)
 
-# Milestone 4h - basis M4g (fix JNI String.equals + hooks) + patch fokus crash nativeResume.
+# Milestone 4i - basis M4h (handler crash dirantai, glue stub, pthread bionic) + 4 fix hasil review.
 # SELF-CONTAINED: source m4loader.c di-embed di sini, tidak perlu file lain di repo.
-# Jalankan manual: tab Actions -> "Build Blown Away M4h (armhf, self-contained)" -> Run workflow.
+# Jalankan manual: tab Actions -> "Build Blown Away M4i (armhf, self-contained)" -> Run workflow.
 #
 # CATATAN: file ini menggantikan workflow M4e lama (build-blownaway-m4e.yml).
 # Workflow M4e lama gagal karena mencoba membaca build-blownaway-m4d.yml dari repo.
@@ -28,8 +28,13 @@ jobs:
         run: |
           mkdir -p src out/blownaway
           cat > src/m4loader.c <<'EOF_C'
-          /* m4loader (M4h) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
+          /* m4loader (M4i) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
            * Basis: M4g (fix JNI String.equals + hook libunity).
+           * Perubahan M4i (fix hasil review M4h):
+           *  (a) shim_cond_timedwait_mono: kurung kurang -> compile error.
+           *  (b) pthread_isjoined/isdetached tidak ada di glibc -> link error; jadi stub return 0.
+           *  (c) pthread_getattr_np menerima TID (pthread_self() bionic = TID) -> dipetakan ke pthread_t nyata.
+           *  (d) game_trace membaca stack dari sp di ucontext (bukan frame handler di altstack), maks 1024 kata.
            * Perubahan M4h (fokus: crash di nativeResume):
            *  (1) Handler crash libunity TIDAK lagi ditelan -> dirantai: diagnose dulu, lalu panggil handler asli game.
            *      M4g menelan sigaction handler libunity, sehingga saat Unity memanggil raise(SIGSEGV)
@@ -216,12 +221,12 @@ jobs:
             return 0;
           }
           /* jejak pemanggil: nilai stack yang jatuh di modul game DAN didahului instruksi panggilan */
-          static void game_trace(const char *why) {
+          static void game_trace(const char *why, u32 sp0) {
           #if defined(__arm__)
-            const uintptr_t *sp = (const uintptr_t *)__builtin_frame_address(0);
+            const uintptr_t *sp = (const uintptr_t *)PTR(sp0);
             int k, shown = 0;
             LOG("  [jejak] %s (return address game di stack, terdekat dulu):\n", why);
-            for (k = 0; k < 4096 && shown < 40; k++) {
+            for (k = 0; sp0 && k < 1024 && shown < 40; k++) {
               uintptr_t v = sp[k]; int i;
               for (i = 0; i < g_nlibs; i++) {
                 u32 b = U32(g_libs[i]->base);
@@ -239,7 +244,7 @@ jobs:
             }
             if (!shown) LOG("    (tidak ada return address game yang dikenali)\n");
           #else
-            (void)why;
+            (void)why; (void)sp0;
           #endif
           }
           static void dump_regs(const char *tag, int sig, siginfo_t *si, void *ucv) {
@@ -282,7 +287,7 @@ jobs:
               }
               LOG("\n");
             }
-            game_trace("crash");
+            game_trace("crash", sp);
           }
           static void crash_handler(int sig, siginfo_t *si, void *ucv) { dump_regs("CRASH", sig, si, ucv); _exit(128 + sig); }
           static void hang_handler(int sig, siginfo_t *si, void *ucv) { dump_regs("THREAD UTAMA DIAM (watchdog)", sig, si, ucv); }
@@ -493,7 +498,7 @@ jobs:
             struct timespec nm, nr, ar; long long dn, tt;
             clock_gettime(CLOCK_MONOTONIC, &nm); clock_gettime(CLOCK_REALTIME, &nr);
             dn = ((long long)t->tv_sec - nm.tv_sec) * 1000000000LL + ((long long)t->tv_nsec - nm.tv_nsec);
-            tt = ((long long)nr.tv_sec * 1000000000LL + nr.tv_nsec + dn; if (tt < 0) tt = 0;
+            tt = (long long)nr.tv_sec * 1000000000LL + nr.tv_nsec + dn; if (tt < 0) tt = 0;
             ar.tv_sec = (time_t)(tt / 1000000000LL); ar.tv_nsec = (long)(tt % 1000000000LL);
             return pthread_cond_timedwait(cget(g), mget(m), &ar);
           }
@@ -517,8 +522,13 @@ jobs:
           static int shim_attr_setschedpolicy(void *g, int p) { return pthread_attr_setschedpolicy(aget_or_init(g), p); }
           static int shim_attr_getstack(void *g, void **a, size_t *s) { return pthread_attr_getstack(aget_or_init(g), a, s); }
           static int shim_getattr_np(pthread_t t, void *g) {
-            pthread_attr_t *a = calloc(1, sizeof *a); int r;
-            pthread_attr_init(a); r = pthread_getattr_np(t, a); *(u32 *)g = U32(a); return r;
+            pthread_attr_t *a = calloc(1, sizeof *a); int r; pthread_t real = t;
+            if (handle_is_tid((void *)t)) {
+              int tid = (int)(uintptr_t)t;
+              real = (tid == shim_gettid()) ? pthread_self() : thmap_get(tid);
+              if (!real) { free(a); return ESRCH; }
+            }
+            pthread_attr_init(a); r = pthread_getattr_np(real, a); *(u32 *)g = U32(a); return r;
           }
           typedef struct { void *(*fn)(void *); void *arg; int tid; int ready; } TStart;
           static void *thread_tramp(void *p) {
@@ -550,7 +560,7 @@ jobs:
               tid = ts->tid; real = *t;
               thmap_add(tid, real);
               /* emulate bionic: handle yang dilihat game adalah TID, bukan pointer glibc */
-              *(pthread_t *)t = (pthread_t)(uintptr_t)tid;
+              *(u32 *)t = (u32)tid;
             }
             pthread_mutex_unlock(&g_ts_mu);
             free(ts);
@@ -565,14 +575,9 @@ jobs:
           static void *shim_pthread_self(void) { return (void *)(uintptr_t)shim_gettid(); }
           static int shim_pthread_equal(void *a, void *b) { return a == b; }
           static int shim_pthread_yield(void) { return sched_yield(); }
-          static int shim_pthread_isjoined(void *h) {
-            if (handle_is_tid(h)) return 0;
-            return pthread_isjoined((pthread_t)h);
-          }
-          static int shim_pthread_isdetached(void *h) {
-            if (handle_is_tid(h)) return 0;
-            return pthread_isdetached((pthread_t)h);
-          }
+          /* glibc tidak punya pthread_isjoined/pthread_isdetached (M4i: sebelumnya link error) */
+          static int shim_pthread_isjoined(void *h) { (void)h; return 0; }
+          static int shim_pthread_isdetached(void *h) { (void)h; return 0; }
           static int shim_pthread_join(void *h, void **ret) {
             int tid;
             if (handle_is_tid(h)) {
@@ -1841,7 +1846,7 @@ jobs:
             }
             if (!g_ndump) parse_dump("30,150,600");
             g_log = fopen(logpath, "w");
-            LOG("== m4loader (Blown Away Milestone 4h) stage=%d libdir=%s apk=%s datadir=%s\n", g_stage, g_libdir, g_apk[0] ? g_apk : "(tidak ada)", g_datadir);
+            LOG("== m4loader (Blown Away Milestone 4i) stage=%d libdir=%s apk=%s datadir=%s\n", g_stage, g_libdir, g_apk[0] ? g_apk : "(tidak ada)", g_datadir);
             init_tables(); install_crash(); preload_host();
             g_run_init = g_stage >= 2;
             if (g_stage >= 2) jni_init();
@@ -1884,9 +1889,9 @@ jobs:
             _exit(0);
           }
           EOF_C
-          cat > out/BlownAwayM4h.sh <<'EOF_L'
+          cat > out/BlownAwayM4i.sh <<'EOF_L'
           #!/bin/bash
-          # Blown Away - Milestone 4h: handler crash Unity dirantai + pthread semantik bionic + stub glue Android.
+          # Blown Away - Milestone 4i: handler crash Unity dirantai + pthread semantik bionic + stub glue Android.
           # Hasil: blownaway/m4_log.txt, m4_stdout.txt, m4_frame_*.bmp
           XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
           for c in /opt/system/Tools/PortMaster /opt/tools/PortMaster "$XDG_DATA_HOME/PortMaster" /roms/ports/PortMaster /mnt/mmc/MUOS/PortMaster; do
@@ -1907,7 +1912,7 @@ jobs:
           : > "$OUT"
           APK="$(ls ./*.apk 2>/dev/null | head -n1)"
           {
-            echo "m4h launcher $(date)"
+            echo "m4i launcher $(date)"
             echo "GAMEDIR=$GAMEDIR  APK=${APK:-TIDAK ADA}"
             echo "uname: $(uname -a)"
             for f in libmain.so libmono.so libunity.so; do
@@ -1929,8 +1934,8 @@ jobs:
           type pm_finish >/dev/null 2>&1 && pm_finish
           exit 0
           EOF_L
-          bash -n out/BlownAwayM4h.sh
-          chmod +x out/BlownAwayM4h.sh
+          bash -n out/BlownAwayM4i.sh
+          chmod +x out/BlownAwayM4i.sh
 
       - name: Kompilasi (armhf, glibc)
         run: |
@@ -1953,5 +1958,5 @@ jobs:
       - name: Unggah artefak
         uses: actions/upload-artifact@v4
         with:
-          name: blownaway-m4h-armhf
+          name: blownaway-m4i-armhf
           path: out/
