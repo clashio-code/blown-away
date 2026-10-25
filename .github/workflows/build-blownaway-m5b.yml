@@ -2279,7 +2279,7 @@ jobs:
             echo "SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-(default)}"
           } >> "$OUT" 2>&1
 
-          ARGS="--stage 4 --libdir libs --apk $APK --datadir files --log m4_log.txt --maxsec 1800 --dump 60,900 --hooks"
+          ARGS="--stage 4 --libdir libs --apk $APK --datadir files --log m4_log.txt --maxsec 1800 --dump 120,600,1200,1800,2400,3000,3600 --hooks"
           if command -v timeout >/dev/null 2>&1; then
             timeout 1900 ./m4loader $ARGS >> "$OUT" 2>&1
           else
