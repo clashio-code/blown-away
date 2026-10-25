@@ -3,6 +3,11 @@ name: Build Blown Away M4h (armhf, self-contained)
 # Milestone 4h - basis M4g (fix JNI String.equals + hooks) + patch fokus crash nativeResume.
 # SELF-CONTAINED: source m4loader.c di-embed di sini, tidak perlu file lain di repo.
 # Jalankan manual: tab Actions -> "Build Blown Away M4h (armhf, self-contained)" -> Run workflow.
+#
+# CATATAN: file ini menggantikan workflow M4e lama (build-blownaway-m4e.yml).
+# Workflow M4e lama gagal karena mencoba membaca build-blownaway-m4d.yml dari repo.
+# Kalau masih ada workflow "Build Blown Away M4e" di tab Actions, hapus file .github/workflows/build-blownaway-m4e.yml
+# supaya tidak tertukar.
 
 on:
   workflow_dispatch:
