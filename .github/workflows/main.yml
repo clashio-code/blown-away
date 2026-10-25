@@ -1,12 +1,12 @@
-name: Build Blown Away M4c (armhf)
+name: Build Blown Away M4d (armhf)
 
 # Milestone 4b (M4 + penelusuran akses file + penangkap crash m4loader): window SDL2 + EGL dibungkus ke SDL + loop nativeRender (dump frame ke BMP).
-# Jalankan manual: tab Actions -> "Build Blown Away M4c (armhf)" -> Run workflow.
+# Jalankan manual: tab Actions -> "Build Blown Away M4d (armhf)" -> Run workflow.
 on:
   workflow_dispatch:
   push:
     paths:
-      - '.github/workflows/build-blownaway-m4c.yml'
+      - '.github/workflows/build-blownaway-m4d.yml'
 
 jobs:
   build:
@@ -21,7 +21,7 @@ jobs:
         run: |
           mkdir -p src out/blownaway
           cat > src/m4loader.c <<'EOF_C'
-          /* m4loader (dasar: m3loader, Milestone 3 + 4c) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
+          /* m4loader (dasar: m3loader, Milestone 3 + 4d) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
            * Isi: loader ELF ARM buatan sendiri (libmain/libmono/libunity tidak bisa di-dlopen glibc), shim bionic->glibc,
            *      fake JNIEnv/JavaVM yang mencatat semua permintaan, crash handler yang menunjuk lib+offset.
            * Pakai: m3loader --stage N --libdir DIR --apk FILE --datadir DIR --log FILE
@@ -54,6 +54,7 @@ jobs:
           #include <sys/syscall.h>
           #include <sys/types.h>
           #include <ucontext.h>
+          #include <sys/prctl.h>
 
           typedef uint32_t u32;
           static inline u32 U32(const void *p) { return (u32)(uintptr_t)p; }
@@ -182,6 +183,11 @@ jobs:
             LOG("\n*** %s sinyal=%d fault_addr=%p tid=%d\n", tag, sig, si ? si->si_addr : NULL, (int)syscall(SYS_gettid));
             annot(pc, b1, sizeof b1); LOG("    pc=%08x  %s\n", pc, b1);
             annot(lr, b1, sizeof b1); LOG("    lr=%08x  %s\n", lr, b1);
+            if (pc > 64 && maps_find(pc, b1, b1 + 16, &i)) {
+              const uint8_t *cp = (const uint8_t *)PTR(pc - 24); char hx[120]; int k, n = 0;
+              for (k = 0; k < 32; k++) n += snprintf(hx + n, sizeof hx - (size_t)n, "%02x%s", cp[k], (k % 2) ? " " : "");
+              LOG("    byte kode pc-24..pc+8: %s\n", hx);
+            }
             if (t_fn) { annot(t_fn, b1, sizeof b1); LOG("    fungsi awal thread ini: %s\n", b1); } else LOG("    (thread utama atau thread bukan buatan game)\n");
             LOG("    sp=%08x\n", sp);
             if (sp) {
@@ -283,7 +289,7 @@ jobs:
           static int *shim_get_h_errno(void) { return &shim_herrno; }
           static int shim_gettid(void) { return (int)syscall(SYS_gettid); }
           static int msig(int s) { return s >= 32 ? s + 2 : s; } /* SIGRTMIN bionic=32, glibc=34 */
-          static int shim_tkill(int tid, int sig) { return (int)syscall(SYS_tkill, tid, msig(sig)); }
+          static int shim_tkill(int tid, int sig) { LOG("[SYS] tkill(%d, %d)\n", tid, sig); return (int)syscall(SYS_tkill, tid, msig(sig)); }
           static void *shim_bsd_signal(int sig, void *h) { return (void *)signal(msig(sig), (void (*)(int))h); }
 
           static size_t shim_strlcpy(char *d, const char *s, size_t n) {
@@ -416,10 +422,32 @@ jobs:
             return t.fn(t.arg);
           }
           static int shim_pthread_create(pthread_t *t, void *attr, void *(*fn)(void *), void *arg) {
-            TStart *ts = malloc(sizeof *ts); ts->fn = fn; ts->arg = arg;
-            return pthread_create(t, attr ? aget(attr) : NULL, thread_tramp, ts);
+            TStart *ts = malloc(sizeof *ts); u32 o; const char *l = addr2lib(U32((void *)fn), &o); pthread_attr_t *ha = attr ? aget(attr) : NULL; int r;
+            size_t ss = 0;
+            ts->fn = fn; ts->arg = arg;
+            if (ha) pthread_attr_getstacksize(ha, &ss);
+            LOG("[THREAD] pthread_create dipanggil: fungsi=%s+0x%x attr=%p stacksize=%u\n", l, o, (void *)ha, (unsigned)ss);
+            r = pthread_create(t, ha, thread_tramp, ts);
+            LOG("[THREAD] pthread_create -> %d\n", r);
+            return r;
           }
-          static int shim_pthread_kill(pthread_t t, int sig) { return pthread_kill(t, msig(sig)); }
+          static void log_caller(const char *what, void *ra) {
+            char b[300]; maps_load(); annot(U32(ra), b, sizeof b);
+            LOG("[SYS] %s dipanggil dari %s\n", what, b);
+          }
+          static int shim_pthread_kill(pthread_t t, int sig) {
+            char w[80]; snprintf(w, sizeof w, "pthread_kill(0x%lx, %d)", (unsigned long)t, sig);
+            log_caller(w, __builtin_return_address(0));
+            if ((unsigned long)t < 0x100000ul) { LOG("[SYS] pthread_kill: nilai thread kecil (%lu), kemungkinan tid bukan pthread_t -> ESRCH\n", (unsigned long)t); return ESRCH; }
+            return pthread_kill(t, msig(sig));
+          }
+          static int shim_raise(int sig) { char w[40]; snprintf(w, sizeof w, "raise(%d)", sig); log_caller(w, __builtin_return_address(0)); return raise(msig(sig)); }
+          static void shim_abort(void) { log_caller("abort()", __builtin_return_address(0)); abort(); }
+          static int shim_kill(int pid, int sig) { char w[60]; snprintf(w, sizeof w, "kill(%d, %d)", pid, sig); log_caller(w, __builtin_return_address(0)); return kill(pid, sig == 0 ? 0 : msig(sig)); }
+          static int shim_prctl(int op, unsigned long a2, unsigned long a3, unsigned long a4, unsigned long a5) {
+            if (op == 15) LOG("[SYS] prctl(PR_SET_NAME, \"%s\")\n", (const char *)(uintptr_t)a2); else LOG("[SYS] prctl(%d, %lu)\n", op, a2);
+            return prctl(op, a2, a3, a4, a5);
+          }
           typedef struct { u32 prev; void (*routine)(void *); void *arg; } BCleanup;
           static void shim_cleanup_push(BCleanup *c, void (*r)(void *), void *a) { c->routine = r; c->arg = a; c->prev = 0; }
           static void shim_cleanup_pop(BCleanup *c, int ex) { if (ex && c->routine) c->routine(c->arg); }
@@ -841,7 +869,7 @@ jobs:
             SH("pthread_attr_getdetachstate", shim_attr_getdetachstate), SH("pthread_attr_setstacksize", shim_attr_setstacksize),
             SH("pthread_attr_setschedparam", shim_attr_setschedparam), SH("pthread_attr_setschedpolicy", shim_attr_setschedpolicy),
             SH("pthread_attr_getstack", shim_attr_getstack), SH("pthread_getattr_np", shim_getattr_np), SH("pthread_create", shim_pthread_create),
-            SH("pthread_kill", shim_pthread_kill), SH("__pthread_cleanup_push", shim_cleanup_push), SH("__pthread_cleanup_pop", shim_cleanup_pop),
+            SH("pthread_kill", shim_pthread_kill), SH("raise", shim_raise), SH("abort", shim_abort), SH("kill", shim_kill), SH("prctl", shim_prctl), SH("__pthread_cleanup_push", shim_cleanup_push), SH("__pthread_cleanup_pop", shim_cleanup_pop),
             SH("sem_init", shim_sem_init), SH("sem_destroy", shim_sem_destroy), SH("sem_post", shim_sem_post), SH("sem_wait", shim_sem_wait),
             SH("sem_trywait", shim_sem_trywait), SH("sem_timedwait", shim_sem_timedwait), SH("sem_getvalue", shim_sem_getvalue),
             SH("sigaction", shim_sigaction), SH("sigprocmask", shim_sigprocmask), SH("pthread_sigmask", shim_pthread_sigmask), SH("sigsuspend", shim_sigsuspend),
@@ -1548,5 +1576,5 @@ jobs:
       - name: Unggah artefak
         uses: actions/upload-artifact@v4
         with:
-          name: blownaway-m4c-armhf
+          name: blownaway-m4d-armhf
           path: out/
