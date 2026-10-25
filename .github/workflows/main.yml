@@ -1,12 +1,12 @@
-name: Build Blown Away M4d (armhf)
+name: Build Blown Away M4e (armhf)
 
 # Milestone 4b (M4 + penelusuran akses file + penangkap crash m4loader): window SDL2 + EGL dibungkus ke SDL + loop nativeRender (dump frame ke BMP).
-# Jalankan manual: tab Actions -> "Build Blown Away M4d (armhf)" -> Run workflow.
+# Jalankan manual: tab Actions -> "Build Blown Away M4e (armhf)" -> Run workflow.
 on:
   workflow_dispatch:
   push:
     paths:
-      - '.github/workflows/build-blownaway-m4d.yml'
+      - '.github/workflows/build-blownaway-m4e.yml'
 
 jobs:
   build:
@@ -21,7 +21,7 @@ jobs:
         run: |
           mkdir -p src out/blownaway
           cat > src/m4loader.c <<'EOF_C'
-          /* m4loader (dasar: m3loader, Milestone 3 + 4d) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
+          /* m4loader (dasar: m3loader, Milestone 3 + 4e) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
            * Isi: loader ELF ARM buatan sendiri (libmain/libmono/libunity tidak bisa di-dlopen glibc), shim bionic->glibc,
            *      fake JNIEnv/JavaVM yang mencatat semua permintaan, crash handler yang menunjuk lib+offset.
            * Pakai: m3loader --stage N --libdir DIR --apk FILE --datadir DIR --log FILE
@@ -1411,6 +1411,19 @@ jobs:
             if (g_query && n_32) LOG("== nativeRequested32bitDisplayBuffer = %d\n", ((NatI0)n_32->fn)(&g_env_head, player) & 0xff);
             LOG("== SDL/EGL init ...\n");
             if (gfx_init()) return 1;
+            {
+              /* SDL (build mali) bisa memasang handler sinyal crash sendiri; cek lalu pasang ulang punya kita */
+              static const int sg[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, 0 }; int k;
+              maps_load();
+              for (k = 0; sg[k]; k++) {
+                struct sigaction cur; char b[300];
+                if (sigaction(sg[k], NULL, &cur) == 0 && cur.sa_sigaction != crash_handler) {
+                  annot(U32((void *)cur.sa_sigaction), b, sizeof b);
+                  LOG("[SIG] sinyal %d: handler diganti pihak lain (%s), dipasang ulang\n", sg[k], b);
+                }
+              }
+              install_crash();
+            }
             if (n_or) ((NatVI)n_or->fn)(&g_env_head, player, g_orient);
             if (n_dd) ((NatVI)n_dd->fn)(&g_env_head, player, 0);
             LOG("== nativeRecreateGfxState ...\n");
@@ -1576,5 +1589,5 @@ jobs:
       - name: Unggah artefak
         uses: actions/upload-artifact@v4
         with:
-          name: blownaway-m4d-armhf
+          name: blownaway-m4e-armhf
           path: out/
