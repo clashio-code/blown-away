@@ -1,8 +1,8 @@
-name: Build Blown Away M4i (armhf, self-contained)
+name: Build Blown Away M4j (armhf, self-contained)
 
-# Milestone 4i - basis M4h (handler crash dirantai, glue stub, pthread bionic) + 4 fix hasil review.
+# Milestone 4j - basis M4j + shim pthread_{get,set}schedparam (handle TID bionic) + stub AMotionEvent_getFlags.
 # SELF-CONTAINED: source m4loader.c di-embed di sini, tidak perlu file lain di repo.
-# Jalankan manual: tab Actions -> "Build Blown Away M4i (armhf, self-contained)" -> Run workflow.
+# Jalankan manual: tab Actions -> "Build Blown Away M4j (armhf, self-contained)" -> Run workflow.
 #
 # CATATAN: file ini menggantikan workflow M4e lama (build-blownaway-m4e.yml).
 # Workflow M4e lama gagal karena mencoba membaca build-blownaway-m4d.yml dari repo.
@@ -28,8 +28,13 @@ jobs:
         run: |
           mkdir -p src out/blownaway
           cat > src/m4loader.c <<'EOF_C'
-          /* m4loader (M4i) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
+          /* m4loader (M4j) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
            * Basis: M4g (fix JNI String.equals + hook libunity).
+           * Perubahan M4j (crash M4i: pthread_getschedparam(TID) -> SIGSEGV, fault_addr=TID+offset):
+           *  (a) shim pthread_getschedparam/setschedparam/setschedprio/setaffinity_np/getaffinity_np:
+           *      handle TID bionic dipetakan ke pthread_t glibc (real_pt) sebelum diteruskan.
+           *  (b) thread utama didaftarkan ke g_thmap di awal main().
+           *  (c) stub AMotionEvent_getFlags (satu-satunya TAK-KETEMU di libmain).
            * Perubahan M4i (fix hasil review M4h):
            *  (a) shim_cond_timedwait_mono: kurung kurang -> compile error.
            *  (b) pthread_isjoined/isdetached tidak ada di glibc -> link error; jadi stub return 0.
@@ -530,6 +535,43 @@ jobs:
             }
             pthread_attr_init(a); r = pthread_getattr_np(real, a); *(u32 *)g = U32(a); return r;
           }
+          /* M4j: handle bionic (TID) -> pthread_t glibc. 0 bila tidak dikenal. */
+          static pthread_t real_pt(pthread_t t) {
+            if (handle_is_tid((void *)t)) {
+              int tid = (int)(uintptr_t)t;
+              if (tid == shim_gettid()) return pthread_self();
+              return thmap_get(tid);
+            }
+            return t;
+          }
+          static int g_sched_log;
+          static int shim_pthread_getschedparam(pthread_t t, int *policy, struct sched_param *sp) {
+            pthread_t r = real_pt(t);
+            if (g_sched_log++ < 6) LOG("[SYS] pthread_getschedparam(0x%lx) -> real=%s\n", (unsigned long)t, r ? "ok" : "ESRCH");
+            if (!r) return ESRCH;
+            return pthread_getschedparam(r, policy, sp);
+          }
+          static int shim_pthread_setschedparam(pthread_t t, int policy, const struct sched_param *sp) {
+            pthread_t r = real_pt(t);
+            if (g_sched_log++ < 6) LOG("[SYS] pthread_setschedparam(0x%lx, policy=%d) -> real=%s\n", (unsigned long)t, policy, r ? "ok" : "ESRCH");
+            if (!r) return ESRCH;
+            return pthread_setschedparam(r, policy, sp);
+          }
+          static int shim_pthread_setschedprio(pthread_t t, int prio) {
+            pthread_t r = real_pt(t);
+            if (!r) return ESRCH;
+            return pthread_setschedprio(r, prio);
+          }
+          static int shim_pthread_setaffinity_np(pthread_t t, size_t n, const cpu_set_t *s) {
+            pthread_t r = real_pt(t);
+            if (!r) return ESRCH;
+            return pthread_setaffinity_np(r, n, s);
+          }
+          static int shim_pthread_getaffinity_np(pthread_t t, size_t n, cpu_set_t *s) {
+            pthread_t r = real_pt(t);
+            if (!r) return ESRCH;
+            return pthread_getaffinity_np(r, n, s);
+          }
           typedef struct { void *(*fn)(void *); void *arg; int tid; int ready; } TStart;
           static void *thread_tramp(void *p) {
             TStart *t = (TStart *)p; stack_t ss; u32 o; const char *l;
@@ -575,7 +617,7 @@ jobs:
           static void *shim_pthread_self(void) { return (void *)(uintptr_t)shim_gettid(); }
           static int shim_pthread_equal(void *a, void *b) { return a == b; }
           static int shim_pthread_yield(void) { return sched_yield(); }
-          /* glibc tidak punya pthread_isjoined/pthread_isdetached (M4i: sebelumnya link error) */
+          /* glibc tidak punya pthread_isjoined/pthread_isdetached (M4j: sebelumnya link error) */
           static int shim_pthread_isjoined(void *h) { (void)h; return 0; }
           static int shim_pthread_isdetached(void *h) { (void)h; return 0; }
           static int shim_pthread_join(void *h, void **ret) {
@@ -1078,6 +1120,7 @@ jobs:
           static int shim_AMotionEvent_getDownTime(void *e) { (void)e; return 0; }
           static int shim_AMotionEvent_getEventTime(void *e) { (void)e; return 0; }
           static int shim_AMotionEvent_getEdgeFlags(void *e) { (void)e; return 0; }
+          static int shim_AMotionEvent_getFlags(void *e) { (void)e; return 0; }
           static int shim_AMotionEvent_getXPrecision(void *e) { (void)e; return 1; }
           static int shim_AMotionEvent_getYPrecision(void *e) { (void)e; return 1; }
           static int shim_AMotionEvent_getToolMajor(void *e) { (void)e; return 0; }
@@ -1136,6 +1179,9 @@ jobs:
             SH("pthread_kill", shim_pthread_kill), SH("pthread_isjoined", shim_pthread_isjoined), SH("pthread_isdetached", shim_pthread_isdetached),
             SH("pthread_setname_np", shim_pthread_setname_np), SH("pthread_getname_np", shim_pthread_getname_np),
             SH("pthread_exit", shim_pthread_exit),
+            SH("pthread_getschedparam", shim_pthread_getschedparam), SH("pthread_setschedparam", shim_pthread_setschedparam),
+            SH("pthread_setschedprio", shim_pthread_setschedprio), SH("pthread_setaffinity_np", shim_pthread_setaffinity_np),
+            SH("pthread_getaffinity_np", shim_pthread_getaffinity_np),
             SH("raise", shim_raise), SH("abort", shim_abort), SH("kill", shim_kill), SH("prctl", shim_prctl), SH("__pthread_cleanup_push", shim_cleanup_push), SH("__pthread_cleanup_pop", shim_cleanup_pop),
             SH("sem_init", shim_sem_init), SH("sem_destroy", shim_sem_destroy), SH("sem_post", shim_sem_post), SH("sem_wait", shim_sem_wait),
             SH("sem_trywait", shim_sem_trywait), SH("sem_timedwait", shim_sem_timedwait), SH("sem_getvalue", shim_sem_getvalue),
@@ -1168,7 +1214,7 @@ jobs:
             SH("AMotionEvent_getAction", shim_AMotionEvent_getAction), SH("AMotionEvent_getPointerCount", shim_AMotionEvent_getPointerCount),
             SH("AMotionEvent_getPointerId", shim_AMotionEvent_getPointerId), SH("AMotionEvent_getMetaState", shim_AMotionEvent_getMetaState),
             SH("AMotionEvent_getHistorySize", shim_AMotionEvent_getHistorySize), SH("AMotionEvent_getDownTime", shim_AMotionEvent_getDownTime),
-            SH("AMotionEvent_getEventTime", shim_AMotionEvent_getEventTime), SH("AMotionEvent_getEdgeFlags", shim_AMotionEvent_getEdgeFlags),
+            SH("AMotionEvent_getEventTime", shim_AMotionEvent_getEventTime), SH("AMotionEvent_getEdgeFlags", shim_AMotionEvent_getEdgeFlags), SH("AMotionEvent_getFlags", shim_AMotionEvent_getFlags),
             SH("AMotionEvent_getXPrecision", shim_AMotionEvent_getXPrecision), SH("AMotionEvent_getYPrecision", shim_AMotionEvent_getYPrecision),
             SH("AMotionEvent_getToolMajor", shim_AMotionEvent_getToolMajor), SH("AMotionEvent_getToolMinor", shim_AMotionEvent_getToolMinor),
             SH("AMotionEvent_getTouchMajor", shim_AMotionEvent_getTouchMajor), SH("AMotionEvent_getTouchMinor", shim_AMotionEvent_getTouchMinor),
@@ -1846,8 +1892,8 @@ jobs:
             }
             if (!g_ndump) parse_dump("30,150,600");
             g_log = fopen(logpath, "w");
-            LOG("== m4loader (Blown Away Milestone 4i) stage=%d libdir=%s apk=%s datadir=%s\n", g_stage, g_libdir, g_apk[0] ? g_apk : "(tidak ada)", g_datadir);
-            init_tables(); install_crash(); preload_host();
+            LOG("== m4loader (Blown Away Milestone 4j) stage=%d libdir=%s apk=%s datadir=%s\n", g_stage, g_libdir, g_apk[0] ? g_apk : "(tidak ada)", g_datadir);
+            init_tables(); install_crash(); preload_host(); thmap_add(shim_gettid(), pthread_self());
             g_run_init = g_stage >= 2;
             if (g_stage >= 2) jni_init();
             lmain = load_lib("libmain.so"); lmono = load_lib("libmono.so");
@@ -1889,9 +1935,9 @@ jobs:
             _exit(0);
           }
           EOF_C
-          cat > out/BlownAwayM4i.sh <<'EOF_L'
+          cat > out/BlownAwayM4j.sh <<'EOF_L'
           #!/bin/bash
-          # Blown Away - Milestone 4i: handler crash Unity dirantai + pthread semantik bionic + stub glue Android.
+          # Blown Away - Milestone 4j: handler crash Unity dirantai + pthread semantik bionic + stub glue Android.
           # Hasil: blownaway/m4_log.txt, m4_stdout.txt, m4_frame_*.bmp
           XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
           for c in /opt/system/Tools/PortMaster /opt/tools/PortMaster "$XDG_DATA_HOME/PortMaster" /roms/ports/PortMaster /mnt/mmc/MUOS/PortMaster; do
@@ -1912,7 +1958,7 @@ jobs:
           : > "$OUT"
           APK="$(ls ./*.apk 2>/dev/null | head -n1)"
           {
-            echo "m4i launcher $(date)"
+            echo "m4j launcher $(date)"
             echo "GAMEDIR=$GAMEDIR  APK=${APK:-TIDAK ADA}"
             echo "uname: $(uname -a)"
             for f in libmain.so libmono.so libunity.so; do
@@ -1934,8 +1980,8 @@ jobs:
           type pm_finish >/dev/null 2>&1 && pm_finish
           exit 0
           EOF_L
-          bash -n out/BlownAwayM4i.sh
-          chmod +x out/BlownAwayM4i.sh
+          bash -n out/BlownAwayM4j.sh
+          chmod +x out/BlownAwayM4j.sh
 
       - name: Kompilasi (armhf, glibc)
         run: |
@@ -1958,5 +2004,5 @@ jobs:
       - name: Unggah artefak
         uses: actions/upload-artifact@v4
         with:
-          name: blownaway-m4i-armhf
+          name: blownaway-m4j-armhf
           path: out/
