@@ -1,12 +1,12 @@
-name: Build Blown Away M4e (armhf)
+name: Build Blown Away M4f (armhf)
 
 # Milestone 4b (M4 + penelusuran akses file + penangkap crash m4loader): window SDL2 + EGL dibungkus ke SDL + loop nativeRender (dump frame ke BMP).
-# Jalankan manual: tab Actions -> "Build Blown Away M4e (armhf)" -> Run workflow.
+# Jalankan manual: tab Actions -> "Build Blown Away M4f (armhf)" -> Run workflow.
 on:
   workflow_dispatch:
   push:
     paths:
-      - '.github/workflows/build-blownaway-m4e.yml'
+      - '.github/workflows/build-blownaway-m4f.yml'
 
 jobs:
   build:
@@ -21,7 +21,7 @@ jobs:
         run: |
           mkdir -p src out/blownaway
           cat > src/m4loader.c <<'EOF_C'
-          /* m4loader (dasar: m3loader, Milestone 3 + 4e) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
+          /* m4loader (dasar: m3loader, Milestone 3 + 4f) - port Blown Away (Unity 4.6.x Mono, armeabi-v7a, libs bionic) ke Linux armhf (glibc).
            * Isi: loader ELF ARM buatan sendiri (libmain/libmono/libunity tidak bisa di-dlopen glibc), shim bionic->glibc,
            *      fake JNIEnv/JavaVM yang mencatat semua permintaan, crash handler yang menunjuk lib+offset.
            * Pakai: m3loader --stage N --libdir DIR --apk FILE --datadir DIR --log FILE
@@ -1176,6 +1176,7 @@ jobs:
           /* nilai balik string "pintar" untuk method/field yang sering ditanya Unity */
           static const char *special_string(const char *name, JObj *thiz) {
             if (!strcmp(name, "getPackageName")) return "de.blackpants.blownaway";
+            if (!strcmp(name, "getExternalStorageState") || !strcmp(name, "MEDIA_MOUNTED")) return "mounted";
             if (!strcmp(name, "getPackageCodePath") || !strcmp(name, "sourceDir") || !strcmp(name, "publicSourceDir")) return g_apk;
             if (!strcmp(name, "nativeLibraryDir")) return g_libdir;
             if (!strcmp(name, "dataDir")) return g_datadir;
@@ -1190,12 +1191,17 @@ jobs:
             return !strcmp(n, "getFilesDir") || !strcmp(n, "getCacheDir") || !strcmp(n, "getExternalFilesDir") || !strcmp(n, "getExternalCacheDir") ||
                    !strcmp(n, "getObbDir") || !strcmp(n, "getDir") || !strcmp(n, "getDataDirectory") || !strcmp(n, "getExternalStorageDirectory");
           }
-          static u32 call_core(JMeth *m, JObj *thiz) {
+          static u32 call_core(JMeth *m, JObj *thiz, JObj *arg0) {
             const char *rs; int c;
             if (!m) return 0;
             c = ++m->ncalls;
             if (c <= 3 || (c & (c - 1)) == 0) LOG("[JNI] Call%s %s.%s%s (#%d)\n", m->is_static ? "Static" : "", m->cls ? m->cls->cname : "?", m->name, m->sig, c);
             rs = strrchr(m->sig, ')'); if (!rs) return 0; rs++;
+            if (rs[0] == 'Z' && !strcmp(m->name, "equals")) {
+              u32 eq = (thiz && arg0 && thiz->str && arg0->str) ? (strcmp(thiz->str, arg0->str) == 0) : (thiz == arg0);
+              if (m->ncalls <= 3) LOG("[JNI]   equals(\"%s\", \"%s\") = %u\n", thiz && thiz->str ? thiz->str : "?", arg0 && arg0->str ? arg0->str : "?", eq);
+              return eq;
+            }
             if (rs[0] == 'I') { if (!strcmp(m->name, "getSplashMode")) return 2; /* settings.xml: splash_mode=2 */ if (!strcmp(m->name, "getWidth")) return (u32)g_screen_w; if (!strcmp(m->name, "getHeight")) return (u32)g_screen_h; }
             if (rs[0] == 'L') {
               char cn[120]; size_t n = strlen(rs) - 2; JObj *o;
@@ -1209,11 +1215,13 @@ jobs:
             if (rs[0] == '[') return 0;
             return 0;
           }
-          static u32 jni_CallI(void *env, JObj *o, JMeth *m, ...) { (void)env; return call_core(m, o); }
-          static long long jni_CallJ(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o); return 0; }
-          static float jni_CallF(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o); return (m && !strcmp(m->name, "getRefreshRate")) ? 60.0f : 0.0f; }
-          static double jni_CallD(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o); return 0.0; }
-          static void jni_CallV(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o); }
+          static u32 jni_CallI(void *env, JObj *o, JMeth *m, ...) { va_list ap; JObj *a; (void)env; va_start(ap, m); a = va_arg(ap, JObj *); va_end(ap); return call_core(m, o, a); }
+          static u32 jni_CallI_V(void *env, JObj *o, JMeth *m, va_list ap) { JObj *a = va_arg(ap, JObj *); (void)env; return call_core(m, o, a); }
+          static u32 jni_CallI_A(void *env, JObj *o, JMeth *m, const u32 *args) { (void)env; return call_core(m, o, args ? (JObj *)PTR(args[0]) : NULL); }
+          static long long jni_CallJ(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o, NULL); return 0; }
+          static float jni_CallF(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o, NULL); return (m && !strcmp(m->name, "getRefreshRate")) ? 60.0f : 0.0f; }
+          static double jni_CallD(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o, NULL); return 0.0; }
+          static void jni_CallV(void *env, JObj *o, JMeth *m, ...) { (void)env; (void)call_core(m, o, NULL); }
           static JObj *jni_NewObject(void *env, JObj *c, JMeth *m, ...) {
             (void)env; if (m) LOG("[JNI] NewObject %s%s\n", c ? c->cname : "?", m->sig);
             return obj_new(c);
@@ -1309,7 +1317,13 @@ jobs:
             g_jni_tab[25] = (void *)jni_NewRef; g_jni_tab[26] = (void *)jni_EnsureLocalCapacity; g_jni_tab[27] = (void *)jni_AllocObject;
             set3(28, (void *)jni_NewObject);
             g_jni_tab[31] = (void *)jni_GetObjectClass; g_jni_tab[32] = (void *)jni_IsInstanceOf; g_jni_tab[33] = (void *)jni_GetMethodID;
-            for (i = 0; i < 10; i++) { set3(34 + i * 3, callfn[i]); set3(114 + i * 3, callfn[i]); }
+            for (i = 0; i < 10; i++) {
+              if (i < 6) { /* Object..Int: bentuk variadic, va_list, jvalue* ditangani terpisah (butuh argumen pertama untuk String.equals) */
+                int b0 = 34 + i * 3, b1 = 114 + i * 3;
+                g_jni_tab[b0] = (void *)jni_CallI; g_jni_tab[b0 + 1] = (void *)jni_CallI_V; g_jni_tab[b0 + 2] = (void *)jni_CallI_A;
+                g_jni_tab[b1] = (void *)jni_CallI; g_jni_tab[b1 + 1] = (void *)jni_CallI_V; g_jni_tab[b1 + 2] = (void *)jni_CallI_A;
+              } else { set3(34 + i * 3, callfn[i]); set3(114 + i * 3, callfn[i]); }
+            }
             g_jni_tab[94] = (void *)jni_GetFieldID; g_jni_tab[95] = (void *)jni_GetObjectField;
             for (i = 96; i <= 100; i++) g_jni_tab[i] = (void *)jni_GetIntField;
             g_jni_tab[101] = (void *)jni_GetLongField; g_jni_tab[102] = (void *)jni_GetFloatField; g_jni_tab[103] = (void *)jni_GetDoubleField;
@@ -1589,5 +1603,5 @@ jobs:
       - name: Unggah artefak
         uses: actions/upload-artifact@v4
         with:
-          name: blownaway-m4e-armhf
+          name: blownaway-m4f-armhf
           path: out/
