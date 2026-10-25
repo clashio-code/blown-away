@@ -39,8 +39,8 @@ jobs:
            *      tepat sebelum nativeResume, sehingga handler Unity yang sudah dirantai tertimpa.
            *  (3) Diagnostik crash diperkuat: si_code, si_pid, jejak pemanggil game, stack mentah,
            *      nama fungsi game (bukan hanya offset).
-           *  (4) Stub android_native_app_glue lengkap (ALooper/AInput*/AKeyEvent/AMotionEvent/AConfiguration/ASensor).
-           *      Di M4g/M4d 77 simbol ini jatuh ke thunk yang selalu return 0.
+           *  (4) Stub android_native_app_glue lengkap (ALooper, AInputEvent, AKeyEvent, AMotionEvent,
+           *      AConfiguration, ASensor). Di M4g/M4d 77 simbol ini jatuh ke thunk yang selalu return 0.
            *  (5) pthread semantik bionic: pthread_t = TID (bukan pointer TCB glibc).
            * Pakai: m4loader --stage N --libdir DIR --apk FILE --datadir DIR --log FILE
            *   stage 1: muat 3 lib + relokasi + resolusi simbol (TIDAK menjalankan kode game).
@@ -114,6 +114,7 @@ jobs:
             u32 exidx, exidx_n;
             u32 rw_start;
             u32 stub_pool, stub_used;
+            u32 *htab; u32 hsize;
             u32 *rcache; uint8_t *rdone;
             int n_self, n_lib, n_shim, n_host, n_unres, n_bad;
           } Lib;
@@ -549,7 +550,7 @@ jobs:
               tid = ts->tid; real = *t;
               thmap_add(tid, real);
               /* emulate bionic: handle yang dilihat game adalah TID, bukan pointer glibc */
-              *(u32 *)t = (u32)tid;
+              *(pthread_t *)t = (pthread_t)(uintptr_t)tid;
             }
             pthread_mutex_unlock(&g_ts_mu);
             free(ts);
