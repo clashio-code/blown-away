@@ -1974,9 +1974,17 @@ jobs:
             e.is_key = 1; e.action = action; e.keycode = code; e.t_event = now_ms(); e.t_down = e.t_event; e.source = 0x101; /* SOURCE_KEYBOARD */
             inject_event(&e);
           }
+          /* M5c: Unity membaca sentuhan per frame. Tap pendek dari tombol pad bisa membuat DOWN dan UP jatuh di frame yang sama
+           * sehingga fase Began tidak pernah terlihat oleh game. Sentuhan ditahan minimal MINHOLD iterasi render. */
+          #define MINHOLD 6
+          static int g_it, g_down_it, g_pend_up;
           static void touch_press(int dn) {
-            if (dn && !g_touch_down) { g_touch_down = 1; g_cursor_on = 1; touch_event(0); }
-            else if (!dn && g_touch_down) { g_touch_down = 0; touch_event(1); }
+            if (dn && !g_touch_down) { g_touch_down = 1; g_pend_up = 0; g_down_it = g_it; g_cursor_on = 1; touch_event(0); LOG("[input] DOWN iter=%d\n", g_it); }
+            else if (dn && g_touch_down) g_pend_up = 0;               /* ditekan lagi sebelum UP tertunda dilepas: tetap tahan */
+            else if (!dn && g_touch_down) {
+              if (g_it - g_down_it >= MINHOLD) { g_touch_down = 0; touch_event(1); LOG("[input] UP iter=%d (tahan %d)\n", g_it, g_it - g_down_it); }
+              else g_pend_up = 1;                                      /* tunda UP sampai cukup frame */
+            }
           }
           static void pad_dispatch(u32 t, const unsigned char *ev) {
             if (t == 0x651 || t == 0x652) {                         /* tombol controller */
@@ -2008,6 +2016,8 @@ jobs:
           }
           static void pad_update(void) {
             float sp = 5.0f, dx = 0.0f, dy = 0.0f;
+            g_it++;
+            if (g_pend_up && g_touch_down && g_it - g_down_it >= MINHOLD) { g_pend_up = 0; g_touch_down = 0; touch_event(1); LOG("[input] UP tertunda iter=%d (tahan %d)\n", g_it, g_it - g_down_it); }
             if (g_fast) sp *= 2.5f;
             if (g_slow) sp *= 0.35f;
             if (g_dp[0]) dy -= 1.0f;
