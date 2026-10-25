@@ -1,4 +1,4 @@
-name: Build Blown Away M4l (armhf, self-contained)
+name: Build Blown Away M4n (armhf, self-contained)
 
 # Milestone 4l - basis M4k + perbaiki signature stub android_native_app_glue (getSensorList/pollAll/getEvent).
 # SELF-CONTAINED: source m4loader.c di-embed di sini, tidak perlu file lain di repo.
@@ -996,9 +996,48 @@ jobs:
             void *(*GL_CreateContext)(void *); int (*GL_MakeCurrent)(void *, void *); void (*GL_SwapWindow)(void *);
             void *(*GL_GetProcAddress)(const char *); const char *(*GetError)(void); int (*GL_SetSwapInterval)(int);
             void (*GetWindowSize)(void *, int *, int *); int (*PollEvent)(void *); const char *(*GetCurrentVideoDriver)(void);
+            int (*InitSubSystem)(unsigned); int (*NumJoysticks)(void); void *(*JoystickOpen)(int); const char *(*JoystickName)(void *);
+            int (*IsGameController)(int); void *(*GameControllerOpen)(int);
           } sdl;
           static char g_egl_dpy[16], g_egl_cfg[16], g_egl_surf[16];
           static int g_egl_logged;
+          /* ---- M4n: controller + keluar dengan Select+Start (atau tombol Guide/Menu) ----
+           * Layout event SDL2 32-bit: type@0, which@8, button@12, state@13. SDL_CONTROLLER_BUTTON_BACK=4, GUIDE=5, START=6.
+           * Joystick mentah (device tanpa mapping controller): kombinasi --quit-raw a,b (default 6,7). Semua tombol dicatat di log. */
+          static int g_btn_back, g_btn_start, g_pad_log, g_pad_gc, g_raw_a = 6, g_raw_b = 7, g_raw_da, g_raw_db;
+          static void pad_init(void) {
+            int i, n;
+            if (!sdl.InitSubSystem || sdl.InitSubSystem(0x200u | 0x2000u)) { LOG("[pad] init joystick/controller gagal: %s\n", sdl.GetError()); return; }
+            n = sdl.NumJoysticks ? sdl.NumJoysticks() : 0;
+            LOG("[pad] joystick terdeteksi: %d\n", n);
+            for (i = 0; i < n; i++) {
+              void *j = sdl.JoystickOpen ? sdl.JoystickOpen(i) : NULL;
+              int gc = sdl.IsGameController ? sdl.IsGameController(i) : 0;
+              LOG("[pad] #%d nama=\"%s\" gamecontroller=%d\n", i, (j && sdl.JoystickName) ? sdl.JoystickName(j) : "?", gc);
+              if (gc) { g_pad_gc = 1; if (sdl.GameControllerOpen) sdl.GameControllerOpen(i); }
+            }
+            LOG("[pad] keluar: Select+Start (controller) / Guide-Menu / ESC%s\n", g_pad_gc ? "" : " / joystick mentah tombol --quit-raw");
+          }
+          static void pad_event(const unsigned char *ev, int *quit) {
+            u32 t = *(const u32 *)ev;
+            if (t == 0x100) *quit = 1;                                         /* SDL_QUIT */
+            else if (t == 0x300 && *(const u32 *)(ev + 16) == 41) *quit = 1;   /* ESC */
+            else if (t == 0x651 || t == 0x652) {                               /* controller button down/up */
+              int dn = (t == 0x651), b = ev[12];
+              if (g_pad_log++ < 400) LOG("[pad] CTRL button %d %s\n", b, dn ? "TURUN" : "naik");
+              if (b == 4) g_btn_back = dn;
+              if (b == 6) g_btn_start = dn;
+              if ((b == 5 && dn) || (g_btn_back && g_btn_start)) { if (!*quit) LOG("[pad] Select+Start/Guide -> keluar\n"); *quit = 1; }
+            } else if (t == 0x603 || t == 0x604) {                             /* joystick button down/up */
+              int dn = (t == 0x603), b = ev[12];
+              if (g_pad_log++ < 400) LOG("[pad] JOY button %d %s\n", b, dn ? "TURUN" : "naik");
+              if (!g_pad_gc) {
+                if (b == g_raw_a) g_raw_da = dn;
+                if (b == g_raw_b) g_raw_db = dn;
+                if (g_raw_da && g_raw_db) { if (!*quit) LOG("[pad] kombinasi joystick %d+%d -> keluar\n", g_raw_a, g_raw_b); *quit = 1; }
+              }
+            }
+          }
 
           static void dump_frame(int n) {
             void (*readpx)(int, int, int, int, unsigned, unsigned, void *);
@@ -1081,6 +1120,9 @@ jobs:
             SYM(GL_GetProcAddress, "SDL_GL_GetProcAddress"); SYM(GetError, "SDL_GetError"); SYM(GL_SetSwapInterval, "SDL_GL_SetSwapInterval");
             SYM(GetWindowSize, "SDL_GetWindowSize"); SYM(PollEvent, "SDL_PollEvent"); SYM(GetCurrentVideoDriver, "SDL_GetCurrentVideoDriver");
           #undef SYM
+            *(void **)&sdl.InitSubSystem = dlsym(h, "SDL_InitSubSystem"); *(void **)&sdl.NumJoysticks = dlsym(h, "SDL_NumJoysticks");
+            *(void **)&sdl.JoystickOpen = dlsym(h, "SDL_JoystickOpen"); *(void **)&sdl.JoystickName = dlsym(h, "SDL_JoystickName");
+            *(void **)&sdl.IsGameController = dlsym(h, "SDL_IsGameController"); *(void **)&sdl.GameControllerOpen = dlsym(h, "SDL_GameControllerOpen");
             if (sdl.Init(0x20 /*VIDEO*/)) { LOG("[GFX] SDL_Init gagal: %s\n", sdl.GetError()); return 1; }
             LOG("[GFX] SDL video driver: %s\n", sdl.GetCurrentVideoDriver() ? sdl.GetCurrentVideoDriver() : "?");
             for (tries = 0; tries < 2; tries++) {
@@ -1097,6 +1139,7 @@ jobs:
             sdl.GetWindowSize(g_win, &g_screen_w, &g_screen_h);
             sdl.GL_SetSwapInterval(1);
             LOG("[GFX] ukuran jendela %dx%d\n", g_screen_w, g_screen_h);
+            pad_init();
             {
               const char *(*gs)(unsigned) = (const char *(*)(unsigned))sdl.GL_GetProcAddress("glGetString");
               if (gs) LOG("[GFX] GL_RENDERER=%s GL_VERSION=%s\n", gs(0x1F01), gs(0x1F02));
@@ -1549,12 +1592,15 @@ jobs:
             return !strcmp(n, "getFilesDir") || !strcmp(n, "getCacheDir") || !strcmp(n, "getExternalFilesDir") || !strcmp(n, "getExternalCacheDir") ||
                    !strcmp(n, "getObbDir") || !strcmp(n, "getDir") || !strcmp(n, "getDataDirectory") || !strcmp(n, "getExternalStorageDirectory");
           }
+          /* M4m: Java asli memanggil nativeResize(w,h,viewW,viewH) setiap setScreenSize()/triggerResizeCall(); ditunda sampai nativeRender selesai. */
+          static volatile int g_resize_pending;
           /* M4g: call_core menerima argumen pertama supaya String.equals bisa dicek beneran. */
           static u32 call_core(JMeth *m, JObj *thiz, JObj *arg0) {
             const char *rs; int c;
             if (!m) return 0;
             c = ++m->ncalls;
             if (c <= 3 || (c & (c - 1)) == 0) LOG("[JNI] Call%s %s.%s%s (#%d)\n", m->is_static ? "Static" : "", m->cls ? m->cls->cname : "?", m->name, m->sig, c);
+            if (!strcmp(m->name, "triggerResizeCall") || !strcmp(m->name, "setScreenSize")) g_resize_pending = 1;
             rs = strrchr(m->sig, ')'); if (!rs) return 0; rs++;
             if (rs[0] == 'Z' && !strcmp(m->name, "equals")) {
               u32 eq = (thiz && arg0 && thiz->str && arg0->str) ? (strcmp(thiz->str, arg0->str) == 0) : (thiz == arg0);
@@ -1855,8 +1901,8 @@ jobs:
             if (n_dd) ((NatVI)n_dd->fn)(&g_env_head, player, 0);
             LOG("== nativeRecreateGfxState ...\n");
             ((NatVP)n_gfx->fn)(&g_env_head, player, obj_new(cls_get("android/view/Surface")));
-            LOG("== nativeResize(%d,%d,1,0) ...\n", g_screen_w, g_screen_h);
-            ((NatV4)n_rs->fn)(&g_env_head, player, g_screen_w, g_screen_h, 1, 0);
+            LOG("== nativeResize(%d,%d,%d,%d) ...\n", g_screen_w, g_screen_h, g_screen_w, g_screen_h);
+            ((NatV4)n_rs->fn)(&g_env_head, player, g_screen_w, g_screen_h, g_screen_w, g_screen_h);
             if (n_fc) ((NatVI)n_fc->fn)(&g_env_head, player, 1);
             LOG("== nativeResume ...\n");
             ((NatV0)n_re->fn)(&g_env_head, player);
@@ -1866,15 +1912,17 @@ jobs:
             LOG("== loop nativeRender (maks %d detik / %d frame) ...\n", g_maxsec, g_maxframes);
             for (;;) {
               int r, quit = 0;
-              while (sdl.PollEvent(ev)) {
-                u32 type = *(u32 *)ev;
-                if (type == 0x100) quit = 1;                              /* SDL_QUIT */
-                if (type == 0x300 && *(u32 *)(ev + 16) == 41) quit = 1;   /* ESC */
-              }
+              while (sdl.PollEvent(ev)) pad_event(ev, &quit);
               clock_gettime(CLOCK_MONOTONIC, &t1);
               el = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
               if (quit || el >= g_maxsec || g_frames >= g_maxframes) break;
               r = ((NatI0)n_rd->fn)(&g_env_head, player) & 0xff;
+              if (g_resize_pending) {
+                static int nrs;
+                g_resize_pending = 0;
+                if (nrs++ < 10) LOG("[resize] Unity minta resize -> nativeResize(%d,%d,%d,%d)\n", g_screen_w, g_screen_h, g_screen_w, g_screen_h);
+                ((NatV4)n_rs->fn)(&g_env_head, player, g_screen_w, g_screen_h, g_screen_w, g_screen_h);
+              }
               it++;
               if (it <= 5 || it % 120 == 0) LOG("[loop] iter=%d nativeRender=%d frames=%d t=%.1fs\n", it, r, g_frames, el);
               if (!r) { falses++; usleep(16000); }
@@ -1892,6 +1940,7 @@ jobs:
               else if (!strcmp(argv[i], "--apk") && i + 1 < argc) snprintf(g_apk, sizeof g_apk, "%s", argv[++i]);
               else if (!strcmp(argv[i], "--datadir") && i + 1 < argc) snprintf(g_datadir, sizeof g_datadir, "%s", argv[++i]);
               else if (!strcmp(argv[i], "--log") && i + 1 < argc) logpath = argv[++i];
+              else if (!strcmp(argv[i], "--quit-raw") && i + 1 < argc) { const char *q = argv[++i]; g_raw_a = parse_i(q); while (*q && *q != ',') q++; if (*q == ',') g_raw_b = parse_i(q + 1); }
               else if (!strcmp(argv[i], "--maxsec") && i + 1 < argc) g_maxsec = parse_i(argv[++i]);
               else if (!strcmp(argv[i], "--maxframes") && i + 1 < argc) g_maxframes = parse_i(argv[++i]);
               else if (!strcmp(argv[i], "--orient") && i + 1 < argc) g_orient = parse_i(argv[++i]);
@@ -1959,6 +2008,8 @@ jobs:
             [ -f "$c/control.txt" ] && { controlfolder="$c"; break; }
           done
           [ -n "$controlfolder" ] && source "$controlfolder/control.txt" 2>/dev/null
+          type get_controls >/dev/null 2>&1 && get_controls >/dev/null 2>&1
+          [ -n "$sdl_controllerconfig" ] && export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
 
           HERE="$(cd "$(dirname "$0")" && pwd)"
           GAMEDIR="$HERE/blownaway"
